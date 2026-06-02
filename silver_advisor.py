@@ -7,6 +7,7 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timezone
 import requests
 from bs4 import BeautifulSoup
+import pytz
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -23,16 +24,16 @@ st.set_page_config(page_title="Silver Pro Advisor", layout="wide", initial_sideb
 BG_DARK = "#F5F5F5"
 BG_CARD = "#FFFFFF"
 TEXT_PRIMARY = "#000000"
-TEXT_SECONDARY = "#666666"
+TEXT_SECONDARY = "#444444"
 
 # Signal colors - ONLY green and red
 COL_BULL = "#00DD00"  # Clean green for bullish/success
 COL_BEAR = "#FF0000"  # Clean red for bearish/danger
 
 # All other colors map to grayscale or signal colors
-COL_NEUT = "#CCCCCC"  # Light gray for neutral/info
+COL_NEUT = "#888888"  # Medium gray for neutral/info (darker)
 COL_TREND = "#00DD00"  # Use green for trend (bullish emphasis)
-COL_CYAN = "#CCCCCC"   # Light gray instead of cyan
+COL_CYAN = "#888888"   # Medium gray instead of cyan (darker)
 
 # Specialized colors - adjusted for white background
 COL_DXY  = "#00AA00"   # Dark green for dollar (visible on white)
@@ -124,26 +125,64 @@ def compute_macd(series, fast=12, slow=26, signal=9):
     return macd_line, signal_line, histogram
 
 def compute_adx(df, period=14):
-    """ADX + DI lines. Uses .where() to avoid Series mutation."""
+    """ADX + DI lines using Wilder's smoothing (correct method)."""
     high  = df['High']
     low   = df['Low']
     close = df['Close']
     prev_close = close.shift(1)
+
+    # True Range
     tr = pd.concat([
         high - low,
         (high - prev_close).abs(),
         (low  - prev_close).abs()
     ], axis=1).max(axis=1)
+
+    # Directional Movement
     raw_dm_plus  = high.diff()
     raw_dm_minus = -low.diff()
     dm_plus  = raw_dm_plus.clip(lower=0).where(raw_dm_plus  >= raw_dm_minus, 0)
     dm_minus = raw_dm_minus.clip(lower=0).where(raw_dm_minus >= raw_dm_plus,  0)
-    atr      = tr.rolling(period).mean()
-    di_plus  = 100 * (dm_plus.rolling(period).mean()  / atr.replace(0, np.nan))
-    di_minus = 100 * (dm_minus.rolling(period).mean() / atr.replace(0, np.nan))
+
+    # Wilder's Smoothing for TR and DM
+    tr_smooth = pd.Series(index=tr.index, dtype=float)
+    dm_p_smooth = pd.Series(index=dm_plus.index, dtype=float)
+    dm_m_smooth = pd.Series(index=dm_minus.index, dtype=float)
+
+    for i in range(len(tr)):
+        if i < period - 1:
+            tr_smooth.iloc[i] = np.nan
+            dm_p_smooth.iloc[i] = np.nan
+            dm_m_smooth.iloc[i] = np.nan
+        elif i == period - 1:
+            # First smoothed value is sum of period values divided by period
+            tr_smooth.iloc[i] = tr.iloc[0:period].sum() / period
+            dm_p_smooth.iloc[i] = dm_plus.iloc[0:period].sum() / period
+            dm_m_smooth.iloc[i] = dm_minus.iloc[0:period].sum() / period
+        else:
+            # Wilder's smoothing: (previous_smooth * (period-1) + current) / period
+            tr_smooth.iloc[i] = (tr_smooth.iloc[i-1] * (period - 1) + tr.iloc[i]) / period
+            dm_p_smooth.iloc[i] = (dm_p_smooth.iloc[i-1] * (period - 1) + dm_plus.iloc[i]) / period
+            dm_m_smooth.iloc[i] = (dm_m_smooth.iloc[i-1] * (period - 1) + dm_minus.iloc[i]) / period
+
+    # DI calculations from smoothed values
+    di_plus  = 100 * (dm_p_smooth / tr_smooth.replace(0, np.nan))
+    di_minus = 100 * (dm_m_smooth / tr_smooth.replace(0, np.nan))
+
+    # DX calculation
     dx_denom = (di_plus + di_minus).replace(0, np.nan)
-    dx       = 100 * ((di_plus - di_minus).abs() / dx_denom)
-    adx      = dx.rolling(period).mean()
+    dx = 100 * ((di_plus - di_minus).abs() / dx_denom)
+
+    # ADX with Wilder's smoothing
+    adx = pd.Series(index=dx.index, dtype=float)
+    for i in range(len(dx)):
+        if i < period - 1:
+            adx.iloc[i] = np.nan
+        elif i == period - 1:
+            adx.iloc[i] = dx.iloc[0:period].sum() / period
+        else:
+            adx.iloc[i] = (adx.iloc[i-1] * (period - 1) + dx.iloc[i]) / period
+
     return adx, di_plus, di_minus
 
 def compute_atr(df, period=14):
@@ -271,6 +310,14 @@ def detect_rsi_divergence(price, rsi, lookback=10):
         return "bearish"
     return None
 
+def to_swedish_time(ts, fmt='%H:%M'):
+    """Convert UTC timestamp to Swedish time and format."""
+    swedish_tz = pytz.timezone('Europe/Stockholm')
+    if ts.tzinfo is None:
+        ts = pytz.utc.localize(ts)
+    ts_swedish = ts.astimezone(swedish_tz)
+    return ts_swedish.strftime(fmt)
+
 def session_weight(last_ts):
     """Signal confidence multiplier based on trading session liquidity."""
     h = last_ts.hour if hasattr(last_ts, 'hour') else 12
@@ -286,6 +333,21 @@ def is_early_session(last_ts):
     """VWAP is unreliable in first 2 hours of NY session."""
     h = last_ts.hour if hasattr(last_ts, 'hour') else 0
     return 13 <= h <= 14
+
+def apply_time_filter(series, hours=None):
+    """Filter series to last N hours or keep full history. Works across all timeframes."""
+    if series is None or series.empty:
+        return series
+    if hours is not None and hours > 0:
+        # Use time-based filtering instead of candle count
+        # This works consistently across 5m, 15m, 1h, 4h, etc.
+        from datetime import timedelta
+        if len(series) == 0:
+            return series
+        last_time = series.index[-1]
+        cutoff_time = last_time - timedelta(hours=hours)
+        return series[series.index >= cutoff_time]
+    return series
 
 def data_age_hours(last_ts):
     now = datetime.now(timezone.utc)
@@ -592,36 +654,92 @@ def fetch_futures_silver_price():
         return None, None, f"SI=F error"
 
 # ═══════════════════════════════════════════════════════════════════
+# DATA FETCHING — Precious metals via yfinance
+# ═══════════════════════════════════════════════════════════════════
+# Note: Alpha Vantage FX intraday endpoints for metals are premium-only.
+# For now, using yfinance (SI=F, GC=F, PL=F) as the primary data source.
+# These wrapper functions provide a clean interface for future API migration.
+
+def fetch_silver_5m():
+    """
+    Fetch 5-minute silver futures data.
+    Data source: yfinance (SI=F)
+    Period: 10 days (240 hours) to support up to 3-day (72h) time range selection
+    Future: Can be extended to Alpha Vantage if premium subscription available
+    """
+    try:
+        return yf.Ticker("SI=F").history(period="10d", interval="5m")
+    except Exception as e:
+        return None
+
+def fetch_silver_1h():
+    """
+    Fetch 1-hour silver futures data.
+    Data source: yfinance (SI=F)
+    Period: 10 days to support up to 3-day (72h) time range selection
+    """
+    try:
+        return yf.Ticker("SI=F").history(period="10d", interval="1h")
+    except Exception as e:
+        return None
+
+def fetch_gold_1h():
+    """
+    Fetch 1-hour gold futures data.
+    Data source: yfinance (GC=F)
+    Period: 10 days to support up to 3-day (72h) time range selection
+    """
+    try:
+        return yf.Ticker("GC=F").history(period="10d", interval="1h")
+    except Exception as e:
+        return None
+
+def fetch_platinum_1h():
+    """
+    Fetch 1-hour platinum futures data.
+    Data source: yfinance (PL=F)
+    Period: 10 days to support up to 3-day (72h) time range selection
+    """
+    try:
+        return yf.Ticker("PL=F").history(period="10d", interval="1h")
+    except Exception as e:
+        return None
+
+# ═══════════════════════════════════════════════════════════════════
 # DATA LAYER — 5m base feed, resampled to 1h and 4h
 # ═══════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60)
 def gather_intelligence():
     try:
-        # Fetch raw feeds
-        s5m   = yf.Ticker("SI=F").history(period="5d",  interval="5m")
-        s1h   = yf.Ticker("SI=F").history(period="5d",  interval="1h")
-        s4h_raw = yf.Ticker("SI=F").history(period="60d", interval="1h")
-        g1h   = yf.Ticker("GC=F").history(period="5d",  interval="1h")
+        # ── Precious metals data (yfinance) ──
+        s5m   = fetch_silver_5m()
+        s1h   = fetch_silver_1h()
+        g1h   = fetch_gold_1h()
+        pt1h  = fetch_platinum_1h()
+
+        # ── Macro/currency data from yfinance ──
         c5m   = yf.Ticker("HG=F").history(period="5d",  interval="5m")
         dxy5m = yf.Ticker("DX-Y.NYB").history(period="5d", interval="5m")
         dxy1h = yf.Ticker("DX-Y.NYB").history(period="5d", interval="1h")
-        pt1h  = yf.Ticker("PL=F").history(period="5d",  interval="1h")
 
         # Validate primary feeds
         for name, feed in [("Silver 5m", s5m), ("Silver 1h", s1h),
                             ("Gold 1h", g1h), ("DXY 1h", dxy1h)]:
-            if feed.empty:
-                return None, f"{name} feed returned empty. Markets may be closed."
+            if feed is None or feed.empty:
+                return None, f"{name} feed returned empty. Markets may be closed or Alpha Vantage rate limit hit."
 
         # Normalise timezones to UTC
-        feeds = [s5m, s1h, s4h_raw, g1h, c5m, dxy5m, dxy1h, pt1h]
+        feeds = [s5m, s1h, g1h, c5m, dxy5m, dxy1h, pt1h]
         for df in feeds:
-            if not df.empty and hasattr(df.index, 'tz') and df.index.tz is not None:
+            if df is not None and not df.empty and hasattr(df.index, 'tz') and df.index.tz is not None:
                 df.index = df.index.tz_convert("UTC")
 
-        # Build 4h frame
-        s4h = resample_ohlcv(s4h_raw, "4h")
+        # Build 4h frame from 1h data (Alpha Vantage provides ~200 candles, enough for resampling)
+        s4h = resample_ohlcv(s1h, "4h")
+
+        # Build 15m DXY frame (for macro context at entry-level precision)
+        dxy15m = resample_ohlcv(dxy5m, "15min")
 
         # ── Fetch macro context (Real Yields, Basis, Seasonality, COT) ──
         real_yield, ry_trend = fetch_real_yields()
@@ -656,6 +774,22 @@ def gather_intelligence():
         bb_5m_mid_s, bb_5m_up_s, bb_5m_lo_s = compute_bollinger(s5m['Close'], 20, 2)
         kc_5m_mid_s, kc_5m_up_s, kc_5m_lo_s = compute_keltner(s5m, 20, 1.5)
         adx_5m_s, di_plus_5m_s, di_minus_5m_s = compute_adx(s5m, 14)
+
+        # 15-minute indicators (resampled from 5m for smoother, cleaner signals)
+        s15m = resample_ohlcv(s5m, "15min")
+        adx_15m_s, di_plus_15m_s, di_minus_15m_s = compute_adx(s15m, 14)
+        macd_15m_l, macd_15m_sig_s, macd_15m_hist_s = compute_macd(s15m['Close'])
+        rsi_15m_s = compute_rsi(s15m['Close'], 14)
+        atr_15m_s = compute_atr(s15m, 14)
+        bb_15m_mid_s, bb_15m_up_s, bb_15m_lo_s = compute_bollinger(s15m['Close'], 20, 2)
+        kc_15m_mid_s, kc_15m_up_s, kc_15m_lo_s = compute_keltner(s15m, 20, 1.5)
+        obv_15m_s = compute_obv(s15m)
+        obv_15m_ma_s = obv_15m_s.rolling(10).mean()
+        mfi_15m_s = compute_mfi(s15m, 14)
+        stoch_rsi_15m_s = compute_stoch_rsi(s15m['Close'], 14, 14, 3)
+        williams_r_15m_s = compute_williams_r(s15m, 14)
+        vwap_15m_s = compute_vwap(s15m)
+
         vwap_5m_s       = compute_vwap(s5m)
         obv_5m_s        = compute_obv(s5m)
         obv_5m_ma_s     = obv_5m_s.rolling(20).mean()
@@ -693,12 +827,13 @@ def gather_intelligence():
                 return None
 
         live_rsi_5m  = sv(rsi_5m_s);  live_rsi_1h  = sv(rsi_1h_s);  live_rsi_4h  = sv(rsi_4h_s)
-        live_stoch_rsi_5m = sv(stoch_rsi_5m_s); live_stoch_rsi_1h = sv(stoch_rsi_1h_s)
-        live_williams_r_5m = sv(williams_r_5m_s); live_williams_r_1h = sv(williams_r_1h_s)
-        live_mfi_5m = sv(mfi_5m_s); live_mfi_1h = sv(mfi_1h_s)
+        live_stoch_rsi_5m = sv(stoch_rsi_5m_s); live_stoch_rsi_15m = sv(stoch_rsi_15m_s); live_stoch_rsi_1h = sv(stoch_rsi_1h_s)
+        live_williams_r_5m = sv(williams_r_5m_s); live_williams_r_15m = sv(williams_r_15m_s); live_williams_r_1h = sv(williams_r_1h_s)
+        live_mfi_5m = sv(mfi_5m_s); live_mfi_15m = sv(mfi_15m_s); live_mfi_1h = sv(mfi_1h_s)
         live_ce_long_5m = sv(ce_long_5m_s); live_ce_long_1h = sv(ce_long_1h_s)
 
         live_atr_5m  = sv(atr_5m_s)
+        live_atr_15m = sv(atr_15m_s)
         live_atr_pct = round(live_atr_5m / live_silver * 100, 3) if live_atr_5m else None
 
         live_macd_5m      = sv(macd_5m_l);      live_macd_5m_sig  = sv(macd_5m_sig_s)
@@ -716,12 +851,23 @@ def gather_intelligence():
             macd_1h_accel = round(float(hist_1h_clean.iloc[-1]) - float(hist_1h_clean.iloc[-2]), 6)
 
         live_adx_5m  = sv(adx_5m_s);   live_di_plus_5m  = sv(di_plus_5m_s);  live_di_minus_5m  = sv(di_minus_5m_s)
+        live_adx_15m = sv(adx_15m_s);  live_di_plus_15m = sv(di_plus_15m_s); live_di_minus_15m = sv(di_minus_15m_s)
         live_adx_1h  = sv(adx_1h_s);   live_di_plus_1h  = sv(di_plus_1h_s);  live_di_minus_1h  = sv(di_minus_1h_s)
         live_adx_4h  = sv(adx_4h_s);   live_di_plus_4h  = sv(di_plus_4h_s);  live_di_minus_4h  = sv(di_minus_4h_s)
 
+        live_rsi_15m = sv(rsi_15m_s)
+        live_macd_15m      = sv(macd_15m_l);      live_macd_15m_sig  = sv(macd_15m_sig_s)
+        live_macd_15m_hist = sv(macd_15m_hist_s)
+        macd_15m_accel = None
+        hist_15m_clean = macd_15m_hist_s.dropna()
+        if len(hist_15m_clean) >= 2:
+            macd_15m_accel = round(float(hist_15m_clean.iloc[-1]) - float(hist_15m_clean.iloc[-2]), 6)
+
         live_bb_mid_5m = sv(bb_5m_mid_s); live_bb_up_5m = sv(bb_5m_up_s); live_bb_lo_5m = sv(bb_5m_lo_s)
+        live_bb_mid_15m = sv(bb_15m_mid_s); live_bb_up_15m = sv(bb_15m_up_s); live_bb_lo_15m = sv(bb_15m_lo_s)
         live_bb_mid_1h = sv(bb_1h_mid_s); live_bb_up_1h = sv(bb_1h_up_s); live_bb_lo_1h = sv(bb_1h_lo_s)
         live_kc_up_5m  = sv(kc_5m_up_s);  live_kc_lo_5m  = sv(kc_5m_lo_s)
+        live_kc_up_15m = sv(kc_15m_up_s); live_kc_lo_15m = sv(kc_15m_lo_s)
         live_kc_up_1h  = sv(kc_1h_up_s);  live_kc_lo_1h  = sv(kc_1h_lo_s)
 
         bb_width_5m_s = ((bb_5m_up_s - bb_5m_lo_s) / bb_5m_mid_s.replace(0, np.nan) * 100).dropna()
@@ -730,12 +876,15 @@ def gather_intelligence():
         bb_width_1h = round(float(bb_width_1h_s.iloc[-1]), 2) if len(bb_width_1h_s) > 0 and live_bb_mid_1h else None
 
         live_vwap_5m = sv(vwap_5m_s)
+        live_vwap_15m = sv(vwap_15m_s)
         live_vwap_1h = sv(vwap_1h_s)
         early_sess   = is_early_session(last_ts)
 
         live_obv_5m    = sv(obv_5m_s);  live_obv_5m_ma = sv(obv_5m_ma_s)
+        live_obv_15m   = sv(obv_15m_s);  live_obv_15m_ma = sv(obv_15m_ma_s)
         live_obv_1h    = sv(obv_1h_s);  live_obv_1h_ma = sv(obv_1h_ma_s)
         obv_5m_trend   = "RISING" if (live_obv_5m_ma and live_obv_5m > live_obv_5m_ma) else "FALLING"
+        obv_15m_trend  = "RISING" if (live_obv_15m_ma and live_obv_15m > live_obv_15m_ma) else "FALLING"
         obv_1h_trend   = "RISING" if (live_obv_1h_ma and live_obv_1h > live_obv_1h_ma) else "FALLING"
 
         # Timeframe confluence flags (bullish when RSI < 50 AND MACD > 0, 4h uses RSI only)
@@ -764,10 +913,10 @@ def gather_intelligence():
         rsi_div_5m = detect_rsi_divergence(s5m['Close'], rsi_5m_s, lookback=20)
         rsi_div_1h = detect_rsi_divergence(s1h['Close'], rsi_1h_s, lookback=12)
 
-        # DXY trend
-        dxy_ma20_1h = round(float(dxy1h['Close'].tail(20).mean()), 2) if len(dxy1h) >= 20 else None
-        dxy_ma20_5m = round(float(dxy5m['Close'].tail(48).mean()), 2) if not dxy5m.empty and len(dxy5m) >= 48 else dxy_ma20_1h
-        dxy_trend   = "DOWNWARD" if (dxy_ma20_1h and live_dxy < dxy_ma20_1h) else "UPWARD"
+        # DXY trend (15m for entry-level precision)
+        dxy_ma20_15m = round(float(dxy15m['Close'].tail(20).mean()), 2) if len(dxy15m) >= 20 else None
+        dxy_ma20_5m = round(float(dxy5m['Close'].tail(48).mean()), 2) if not dxy5m.empty and len(dxy5m) >= 48 else dxy_ma20_15m
+        dxy_trend   = "DOWNWARD" if (dxy_ma20_15m and live_dxy < dxy_ma20_15m) else "UPWARD"
 
         # Gold/Silver ratio
         gs_series   = (g1h['Close'] / s1h['Close']).dropna()
@@ -777,6 +926,7 @@ def gather_intelligence():
 
         # Copper inter-market
         copper_ratio = copper_ratio_ma8 = None
+        cu_s = None  # Initialize copper/gold ratio series
         if not c5m.empty and live_copper:
             c1h_rs = resample_ohlcv(c5m, "1h")
             if not c1h_rs.empty and len(c1h_rs) >= 2:
@@ -822,6 +972,7 @@ def gather_intelligence():
             "s5m": s5m, "s1h": s1h, "s4h": s4h,
             "dxy5m": dxy5m, "dxy1h": dxy1h,
             "gs_ratio": gs_series,
+            "cu_ratio": cu_s,  # Copper/Gold ratio series for Inter-Market chart
             "pt1h": pt1h,
             # 5m series
             "rsi_5m": rsi_5m_s, "stoch_rsi_5m": stoch_rsi_5m_s, "williams_r_5m": williams_r_5m_s, "mfi_5m": mfi_5m_s,
@@ -831,6 +982,17 @@ def gather_intelligence():
             "vwap_5m": vwap_5m_s, "obv_5m": obv_5m_s, "obv_5m_ma": obv_5m_ma_s,
             "adx_5m": adx_5m_s, "di_plus_5m": di_plus_5m_s, "di_minus_5m": di_minus_5m_s,
             "ce_long_5m": ce_long_5m_s,
+            # 15m series
+            "s15m": s15m,
+            "rsi_15m": rsi_15m_s, "stoch_rsi_15m": stoch_rsi_15m_s, "williams_r_15m": williams_r_15m_s,
+            "macd_15m_l": macd_15m_l, "macd_15m_sig": macd_15m_sig_s, "macd_15m_hist": macd_15m_hist_s,
+            "bb_15m_up": bb_15m_up_s, "bb_15m_mid": bb_15m_mid_s, "bb_15m_lo": bb_15m_lo_s,
+            "kc_15m_up": kc_15m_up_s, "kc_15m_lo": kc_15m_lo_s,
+            "vwap_15m": vwap_15m_s, "obv_15m": obv_15m_s, "obv_15m_ma": obv_15m_ma_s,
+            "mfi_15m": mfi_15m_s,
+            "atr_15m": atr_15m_s,
+            "adx_15m": adx_15m_s, "di_plus_15m": di_plus_15m_s, "di_minus_15m": di_minus_15m_s,
+            "dxy15m": dxy15m,
             # 1h series
             "rsi_1h": rsi_1h_s, "stoch_rsi_1h": stoch_rsi_1h_s, "williams_r_1h": williams_r_1h_s, "mfi_1h": mfi_1h_s,
             "macd_1h_l": macd_1h_l, "macd_1h_sig": macd_1h_sig_s, "macd_1h_hist": macd_1h_hist_s,
@@ -851,40 +1013,45 @@ def gather_intelligence():
             "last_ts": last_ts, "gs_ratio": gs_ratio,
             "gs_5d_avg": gs_5d_avg, "gs_5d_max": gs_5d_max, "gs_5d_min": gs_5d_min,
             # ATR
-            "atr_5m": live_atr_5m, "atr_pct": live_atr_pct,
+            "atr_5m": live_atr_5m, "atr_15m": live_atr_15m, "atr_pct": live_atr_pct,
             # RSI
-            "rsi_5m": live_rsi_5m, "rsi_1h": live_rsi_1h, "rsi_4h": live_rsi_4h,
+            "rsi_5m": live_rsi_5m, "rsi_15m": live_rsi_15m, "rsi_1h": live_rsi_1h, "rsi_4h": live_rsi_4h,
             "rsi_div_5m": rsi_div_5m, "rsi_div_1h": rsi_div_1h,
             # StochRSI
-            "stoch_rsi_5m": live_stoch_rsi_5m, "stoch_rsi_1h": live_stoch_rsi_1h,
+            "stoch_rsi_5m": live_stoch_rsi_5m, "stoch_rsi_15m": live_stoch_rsi_15m, "stoch_rsi_1h": live_stoch_rsi_1h,
             # Williams %R
-            "williams_r_5m": live_williams_r_5m, "williams_r_1h": live_williams_r_1h,
+            "williams_r_5m": live_williams_r_5m, "williams_r_15m": live_williams_r_15m, "williams_r_1h": live_williams_r_1h,
             # MFI
-            "mfi_5m": live_mfi_5m, "mfi_1h": live_mfi_1h,
+            "mfi_5m": live_mfi_5m, "mfi_15m": live_mfi_15m, "mfi_1h": live_mfi_1h,
             # Chandelier Exit
             "ce_long_5m": live_ce_long_5m, "ce_long_1h": live_ce_long_1h,
             # MACD
             "macd_5m": live_macd_5m, "macd_5m_sig": live_macd_5m_sig,
             "macd_5m_hist": live_macd_5m_hist, "macd_5m_accel": macd_5m_accel,
+            "macd_15m": live_macd_15m, "macd_15m_sig": live_macd_15m_sig,
+            "macd_15m_hist": live_macd_15m_hist, "macd_15m_accel": macd_15m_accel,
             "macd_1h": live_macd_1h, "macd_1h_sig": live_macd_1h_sig,
             "macd_1h_hist": live_macd_1h_hist, "macd_1h_accel": macd_1h_accel,
             # ADX
             "adx_5m": live_adx_5m, "di_plus_5m": live_di_plus_5m, "di_minus_5m": live_di_minus_5m,
+            "adx_15m": live_adx_15m, "di_plus_15m": live_di_plus_15m, "di_minus_15m": live_di_minus_15m,
             "adx_1h": live_adx_1h, "di_plus_1h": live_di_plus_1h, "di_minus_1h": live_di_minus_1h,
             "adx_4h": live_adx_4h, "di_plus_4h": live_di_plus_4h, "di_minus_4h": live_di_minus_4h,
             "regime": regime,
             # BB
             "bb_mid_5m": live_bb_mid_5m, "bb_up_5m": live_bb_up_5m, "bb_lo_5m": live_bb_lo_5m,
+            "bb_mid_15m": live_bb_mid_15m, "bb_up_15m": live_bb_up_15m, "bb_lo_15m": live_bb_lo_15m,
             "bb_mid_1h": live_bb_mid_1h, "bb_up_1h": live_bb_up_1h, "bb_lo_1h": live_bb_lo_1h,
             "bb_width_5m": bb_width_5m, "bb_width_1h": bb_width_1h,
             "kc_up_5m": live_kc_up_5m, "kc_lo_5m": live_kc_lo_5m,
+            "kc_up_15m": live_kc_up_15m, "kc_lo_15m": live_kc_lo_15m,
             "kc_up_1h": live_kc_up_1h, "kc_lo_1h": live_kc_lo_1h,
             # VWAP
-            "vwap_5m": live_vwap_5m, "vwap_1h": live_vwap_1h, "early_session": early_sess,
+            "vwap_5m": live_vwap_5m, "vwap_15m": live_vwap_15m, "vwap_1h": live_vwap_1h, "early_session": early_sess,
             # OBV
-            "obv_5m_trend": obv_5m_trend, "obv_1h_trend": obv_1h_trend,
+            "obv_5m_trend": obv_5m_trend, "obv_15m_trend": obv_15m_trend, "obv_1h_trend": obv_1h_trend,
             # DXY
-            "dxy_ma20": dxy_ma20_1h, "dxy_trend": dxy_trend,
+            "dxy_ma20": dxy_ma20_15m, "dxy_trend": dxy_trend,
             # Inter-market
             "copper_ratio": copper_ratio, "copper_ratio_ma8": copper_ratio_ma8,
             # Momentum / vol
@@ -942,21 +1109,36 @@ def run_scoring(d):
         osc_mult = 1.0
         trend_mult = 1.0
 
+    # Detailed explanations for each signal - displayed inline on page
+    signal_explanations = {
+        "DXY Dollar Trend": "**US Dollar Index** measures dollar strength. DXY DOWN → Silver cheaper for foreign buyers → 📈 Bullish. DXY UP → Silver expensive → 📉 Bearish. Commodities priced in USD, so this is critical macro context.",
+        "ADX Trend Regime (15m, 1h, 4h)": "**Average Directional Index** measures trend strength. ADX > 25: Strong trend (follow it). ADX 15-25: Developing (cautious). ADX < 15: Ranging market (oscillators work). This determines your entire strategy.",
+        "Pivot Point Proximity": "**Daily pivot levels** from yesterday's OHLC show institutional support/resistance. Price above Pivot = Bullish bias. Price near S1/R1 = Decision point. Use for stop placement and entry zones.",
+        "Oscillator Consensus (RSI + StochRSI + Williams%R)": "**Combined oscillator signal** from RSI < 50, StochRSI, and Williams%R. Best for entry TIMING, not conviction. Only trade oscillators in RANGING markets (ADX < 15). Use after Phase 1-2 confirm.",
+        "MACD Trend (15m + 1h)": "**Moving Average Convergence Divergence** shows momentum direction. MACD above signal + green histogram = Upward momentum. Below signal + red = Downward. Watch for crossovers = momentum changes.",
+        "OBV Accumulation (15m + 1h)": "**On-Balance Volume** shows volume supporting price. OBV UP with price UP = Accumulation (good). OBV DOWN with price UP = Distribution/exhaustion (bad). Price without volume = fake move.",
+        "MFI Volume Flow (15m + 1h)": "**Money Flow Index** combines price + volume. MFI > 80 = Selling pressure building. MFI < 20 = Buying pressure building. Shows where big money actually flows, not just price momentum.",
+        "VWAP (15m + 1h)": "**Volume-Weighted Average Price** shows institutional fair value. Price above VWAP = Institutional buyers in control. Below = Institutional sellers. Bounces off VWAP = strong support/resistance.",
+        "Bollinger Bands + KC Squeeze (15m/1h)": "**Volatility extremes** show entry zones. Price at LOWER band = Oversold (BUY for bulls). UPPER band = Overbought. Band expansion = Trending. Band contraction = Range-bound. Entry at BB extremes has highest odds.",
+        "Platinum Trend (1h)": "**Precious metal co-movement** - industrial demand indicator. Platinum UP = Industrial demand strong → Silver likely follows. Platinum DOWN = Warning. Lower weight (lagging), use for context.",
+        "Inter-Market: Copper/Gold": "**Risk-on/off indicator**. Copper/Gold ratio RISING = Risk-on (industrial demand > safe havens) → Good for silver. FALLING = Risk-off/fear → Headwind for silver.",
+    }
+
     # Signal weights - used for scoring and display
     signal_weights = {
         # TIER 1: SETUP VALIDATION
-        "ADX Trend Regime (1h)": 3.0,                              # Trend strength (foundational)
+        "ADX Trend Regime (15m, 1h, 4h)": 3.0,                              # Trend strength (foundational)
         "DXY Dollar Trend": 2.5,                                   # Commodity pricing (was 1.0)
         "Pivot Point Proximity": 2.0,                              # Entry/exit safety (was 1.5)
 
         # TIER 2: CONFIRMATION
-        "MACD Trend (5m + 1h)": 2.0,                               # Momentum confirmation
-        "OBV Accumulation (5m + 1h)": 1.5,                         # Volume flow analysis
-        "MFI Volume Flow (5m + 1h)": 1.5,                          # Volume-weighted momentum
-        "VWAP (5m + 1h)": 1.5,                                     # Institutional position (was 1.0)
+        "MACD Trend (15m + 1h)": 2.0,                               # Momentum confirmation
+        "OBV Accumulation (15m + 1h)": 1.5,                         # Volume flow analysis
+        "MFI Volume Flow (15m + 1h)": 1.5,                          # Volume-weighted momentum
+        "VWAP (15m + 1h)": 1.5,                                     # Institutional position (was 1.0)
 
         # TIER 3: ENTRY PRECISION
-        "Bollinger Bands + KC Squeeze (5m/1h)": 1.5,              # Entry zones
+        "Bollinger Bands + KC Squeeze (15m/1h)": 1.5,              # Entry zones
         "Oscillator Consensus (RSI + StochRSI + Williams%R)": 1.0, # Entry timing (was 1.5)
 
         # TIER 4: REFERENCE
@@ -968,8 +1150,10 @@ def run_scoring(d):
         weighted = round(raw_score * sw * mult * 2) / 2
         color = COL_BULL if raw_score > 0 else (COL_BEAR if raw_score < 0 else COL_NEUT)
         weight = signal_weights.get(name, 1.0)
+        # Use detailed explanation from dictionary if available, otherwise use provided detail
+        final_detail = signal_explanations.get(name, detail) if name in signal_explanations else detail
         signals.append({"name": name, "score": weighted, "raw": raw_score,
-                         "max": max_pts, "color": color, "reason": reason, "detail": detail, "weight": weight})
+                         "max": max_pts, "color": color, "reason": reason, "detail": final_detail, "weight": weight})
 
     # ── S1: Oscillator Consensus (RSI + StochRSI + Williams %R) ───
     osc_score = 0
@@ -1042,20 +1226,20 @@ def run_scoring(d):
     # ── S2: MACD Trend Signal ────────────────────────────────────
     macd_score = 0
     macd_reason = []
-    if d['macd_5m'] is not None and d['macd_5m_sig'] is not None:
-        if d['macd_5m'] > d['macd_5m_sig']:
+    if d['macd_15m'] is not None and d['macd_15m_sig'] is not None:
+        if d['macd_15m'] > d['macd_15m_sig']:
             macd_score += 1
-            macd_reason.append("5m MACD above signal (bullish)")
+            macd_reason.append("15m MACD above signal (bullish)")
         else:
             macd_score -= 1
-            macd_reason.append("5m MACD below signal (bearish)")
-        if d['macd_5m_accel'] is not None:
-            if d['macd_5m_accel'] > 0 and d['macd_5m_hist'] > 0:
+            macd_reason.append("15m MACD below signal (bearish)")
+        if d['macd_15m_accel'] is not None:
+            if d['macd_15m_accel'] > 0 and d['macd_15m_hist'] > 0:
                 macd_score += 1
-                macd_reason.append(f"5m histogram accelerating up")
-            elif d['macd_5m_accel'] < 0 and d['macd_5m_hist'] < 0:
+                macd_reason.append(f"15m histogram accelerating up")
+            elif d['macd_15m_accel'] < 0 and d['macd_15m_hist'] < 0:
                 macd_score -= 1
-                macd_reason.append(f"5m histogram accelerating down")
+                macd_reason.append(f"15m histogram accelerating down")
     if d['macd_1h'] is not None and d['macd_1h_sig'] is not None:
         if d['macd_1h'] > d['macd_1h_sig'] and macd_score > 0:
             macd_score += 1
@@ -1064,7 +1248,7 @@ def run_scoring(d):
             macd_score -= 1
             macd_reason.append("1h MACD confirms bearish (-1)")
     macd_score = max(-3, min(3, macd_score))
-    add("MACD Trend (5m + 1h)", macd_score, 3,
+    add("MACD Trend (15m + 1h)", macd_score, 3,
         " | ".join(macd_reason),
         "Histogram acceleration = early signal. 1h confirmation = stronger setup.",
         mult=trend_mult)
@@ -1086,48 +1270,71 @@ def run_scoring(d):
             adx_reason.append(f"ADX={d['adx_1h']:.1f} trending — DI reliable")
         else:
             adx_reason.append(f"ADX={d['adx_1h']:.1f} developing")
-    add("ADX Trend Regime (1h)", adx_score, 1,
+    add("ADX Trend Regime (15m, 1h, 4h)", adx_score, 1,
         " | ".join(adx_reason) if adx_reason else "Insufficient data",
-        "ADX < 15 = range (oscillators win). ADX > 25 = trend (DI direction wins).",
+        "ADX < 15 = range (oscillators win). ADX > 25 = trend (DI direction wins). Shows multi-timeframe confluence.",
         mult=trend_mult)
 
     # ── S4: Bollinger Bands + Keltner Squeeze ────────────────────
     bb_score = 0
     bb_reason = []
-    if d['bb_lo_5m'] is not None and d['kc_lo_5m'] is not None:
-        if d['silver'] <= d['bb_lo_5m']:
+
+    # 15m Bollinger Bands - Entry Signal
+    if d['bb_lo_15m'] is not None and d['bb_mid_15m'] is not None and d['bb_up_15m'] is not None:
+        if d['silver'] <= d['bb_lo_15m']:
             bb_score += 2
-            bb_reason.append(f"5m: Price at/below BB lower (${d['bb_lo_5m']:.2f}) — oversold")
-        elif d['silver'] >= d['bb_up_5m']:
+            bb_reason.append(f"15m: Price at/below BB lower (${d['bb_lo_15m']:.2f}) — oversold/ready to bounce")
+        elif d['silver'] >= d['bb_up_15m']:
             bb_score -= 2
-            bb_reason.append(f"5m: Price at/above BB upper (${d['bb_up_5m']:.2f}) — overbought")
-        elif d['silver'] < d['bb_mid_5m']:
+            bb_reason.append(f"15m: Price at/above BB upper (${d['bb_up_15m']:.2f}) — overbought/ready to drop")
+        elif d['silver'] < d['bb_mid_15m']:
             bb_score += 1
-            bb_reason.append(f"5m: Price in lower BB half")
+            bb_reason.append(f"15m: Price in lower BB half (+1 bullish bias)")
         else:
             bb_score -= 1
-            bb_reason.append(f"5m: Price in upper BB half")
-        squeeze_5m = d['bb_lo_5m'] > d['kc_lo_5m'] and d['bb_up_5m'] < d['kc_up_5m']
-        if squeeze_5m:
-            bb_reason.append("⚡ 5m BB inside KC = SQUEEZE active")
-    if d['bb_lo_1h'] is not None and d['bb_mid_1h'] is not None:
+            bb_reason.append(f"15m: Price in upper BB half (-1 bearish bias)")
+
+    # 1h Bollinger Bands - Confirmation (boost or reduce confidence)
+    if d['bb_lo_1h'] is not None and d['bb_mid_1h'] is not None and d['bb_up_1h'] is not None:
         if d['silver'] < d['bb_mid_1h'] and bb_score > 0:
-            bb_reason.append("1h: Price in lower BB half — confirms bullish bias")
+            bb_score += 1
+            bb_reason.append("1h: Price in lower BB half — confirms bullish bias (+1)")
         elif d['silver'] > d['bb_mid_1h'] and bb_score < 0:
-            bb_reason.append("1h: Price in upper BB half — confirms bearish bias")
-    add("Bollinger Bands + KC Squeeze (5m/1h)", bb_score, 2,
+            bb_score -= 1
+            bb_reason.append("1h: Price in upper BB half — confirms bearish bias (-1)")
+        elif d['silver'] >= d['bb_up_1h']:
+            bb_score -= 1
+            bb_reason.append("1h: Price at/above 1h BB upper — strong overbought (-1)")
+        elif d['silver'] <= d['bb_lo_1h']:
+            bb_score += 1
+            bb_reason.append("1h: Price at/below 1h BB lower — strong oversold (+1)")
+
+    # Keltner Squeeze - Volatility Compression Signal
+    if d['kc_lo_15m'] is not None and d['kc_up_15m'] is not None and d['bb_lo_15m'] is not None and d['bb_up_15m'] is not None:
+        squeeze_15m = d['bb_lo_15m'] > d['kc_lo_15m'] and d['bb_up_15m'] < d['kc_up_15m']
+        if squeeze_15m:
+            bb_reason.append("⚡ KC Squeeze active (BB inside KC) — breakout imminent")
+            # Boost signal if direction is already established
+            if bb_score > 0:
+                bb_score += 1
+                bb_reason.append("   → Squeeze + bullish bias = strong bullish setup (+1)")
+            elif bb_score < 0:
+                bb_score -= 1
+                bb_reason.append("   → Squeeze + bearish bias = strong bearish setup (-1)")
+
+    add("Bollinger Bands + KC Squeeze (15m/1h)", bb_score, 2,
         " | ".join(bb_reason),
-        "5m bands give entry signal. 1h band position = higher-timeframe context. KC Squeeze = breakout imminent.",
+        "15m BB = entry zones (oversold/overbought). 1h BB = confirmation. KC Squeeze = volatility compression (breakout signal).",
         mult=osc_mult)
 
     # ── S5: VWAP ────────────────────────────────────────────────
     if not d['early_session']:
         vwap_score = 0
         vwap_reason = []
-        if d['vwap_5m']:
-            s = 1 if d['silver'] > d['vwap_5m'] else -1
+        if d['vwap_15m']:
+            s = 1 if d['silver'] > d['vwap_15m'] else -1
             vwap_score += s
-            vwap_reason.append(f"5m VWAP: price {'above' if s > 0 else 'below'} (${d['vwap_5m']:.2f})")
+            vwap_reason.append(f"15m VWAP: price {'above' if s > 0 else 'below'} (${d['vwap_15m']:.2f})")
         if d['vwap_1h']:
             s = 1 if d['silver'] > d['vwap_1h'] else -1
             if vwap_score != 0 and np.sign(s) == np.sign(vwap_score):
@@ -1135,16 +1342,16 @@ def run_scoring(d):
             else:
                 vwap_reason.append(f"1h VWAP: price {'above' if s > 0 else 'below'} (${d['vwap_1h']:.2f}) — mixed")
         vwap_score = max(-1, min(1, vwap_score))
-        add("VWAP (5m + 1h)", vwap_score, 1,
+        add("VWAP (15m + 1h)", vwap_score, 1,
             " | ".join(vwap_reason) if vwap_reason else "VWAP unavailable",
             "Institutional intraday benchmark. Both timeframes above = buy-side control.",
             mult=1.0)
     else:
-        add("VWAP", 0, 1, "Early NY session — VWAP unreliable, skipped", "", mult=1.0)
+        add("VWAP (15m + 1h)", 0, 1, "Early NY session (0-2h) — VWAP unreliable, skipped", "", mult=1.0)
 
     # ── S6: OBV Accumulation ─────────────────────────────────────
     obv_score = 0
-    if d['obv_5m_trend'] == "RISING":
+    if d['obv_15m_trend'] == "RISING":
         obv_score += 1
     else:
         obv_score -= 1
@@ -1152,22 +1359,22 @@ def run_scoring(d):
         obv_score = 1
     elif d['obv_1h_trend'] == "FALLING" and obv_score < 0:
         obv_score = -1
-    add("OBV Accumulation (5m + 1h)", obv_score, 1,
-        f"5m OBV: {d['obv_5m_trend']} | 1h OBV: {d['obv_1h_trend']}",
+    add("OBV Accumulation (15m + 1h)", obv_score, 1,
+        f"15m OBV: {d['obv_15m_trend']} | 1h OBV: {d['obv_1h_trend']}",
         "OBV above MA = net buying (accumulation). Both timeframes aligned = stronger.",
         mult=1.0)
 
     # ── S7: Money Flow Index (Volume-Weighted RSI) ───────────────
     mfi_score = 0
     mfi_reason = []
-    mfi5 = d['mfi_5m']
-    if mfi5 is not None:
-        if mfi5 < 20:
+    mfi15 = d['mfi_15m']
+    if mfi15 is not None:
+        if mfi15 < 20:
             mfi_score += 1
-            mfi_reason.append(f"5m MFI={mfi5:.1f} oversold (+1)")
-        elif mfi5 > 80:
+            mfi_reason.append(f"15m MFI={mfi15:.1f} oversold (+1)")
+        elif mfi15 > 80:
             mfi_score -= 1
-            mfi_reason.append(f"5m MFI={mfi5:.1f} overbought (-1)")
+            mfi_reason.append(f"15m MFI={mfi15:.1f} overbought (-1)")
     mfi1 = d['mfi_1h']
     if mfi1 is not None:
         if mfi1 < 45 and mfi_score > 0:
@@ -1177,7 +1384,7 @@ def run_scoring(d):
             mfi_score -= 1
             mfi_reason.append(f"1h MFI={mfi1:.1f} confirms bearish (-1)")
     mfi_score = max(-2, min(2, mfi_score))
-    add("MFI Volume Flow (5m + 1h)", mfi_score, 2,
+    add("MFI Volume Flow (15m + 1h)", mfi_score, 2,
         " | ".join(mfi_reason) if mfi_reason else "Insufficient MFI data",
         "MFI = volume-weighted RSI. Shows if volume supports price moves. > 80 = buying exhaustion.",
         mult=osc_mult)
@@ -1261,18 +1468,18 @@ def calculate_signal_conviction(signals, direction, d, minutes):
     # Define signal importance weights (base)
     signal_weights = {
         # TIER 1: SETUP VALIDATION
-        "ADX Trend Regime (1h)": 3.0,                              # Trend strength (foundational)
+        "ADX Trend Regime (15m, 1h, 4h)": 3.0,                              # Trend strength (foundational)
         "DXY Dollar Trend": 2.5,                                   # Commodity pricing (was 1.0)
         "Pivot Point Proximity": 2.0,                              # Entry/exit safety (was 1.5)
 
         # TIER 2: CONFIRMATION
-        "MACD Trend (5m + 1h)": 2.0,                               # Momentum confirmation
-        "OBV Accumulation (5m + 1h)": 1.5,                         # Volume flow analysis
-        "MFI Volume Flow (5m + 1h)": 1.5,                          # Volume-weighted momentum
-        "VWAP (5m + 1h)": 1.5,                                     # Institutional position (was 1.0)
+        "MACD Trend (15m + 1h)": 2.0,                               # Momentum confirmation
+        "OBV Accumulation (15m + 1h)": 1.5,                         # Volume flow analysis
+        "MFI Volume Flow (15m + 1h)": 1.5,                          # Volume-weighted momentum
+        "VWAP (15m + 1h)": 1.5,                                     # Institutional position (was 1.0)
 
         # TIER 3: ENTRY PRECISION
-        "Bollinger Bands + KC Squeeze (5m/1h)": 1.5,              # Entry zones
+        "Bollinger Bands + KC Squeeze (15m/1h)": 1.5,              # Entry zones
         "Oscillator Consensus (RSI + StochRSI + Williams%R)": 1.0, # Entry timing (was 1.5)
 
         # TIER 4: REFERENCE
@@ -1455,13 +1662,30 @@ def predict_move(d, minutes, signals=None):
 
     # ── Calculate conviction based on SIGNAL CONSENSUS ────────────────
     conviction_breakdown = {"bullish": [], "bearish": [], "neutral": []}
+    confidence_up = 0
+    confidence_down = 0
+
     if signals and direction != "FLAT":
         confidence, conviction_breakdown = calculate_signal_conviction(signals, direction, d, minutes)
         signal_pct = confidence
         reason.append(f"Signal consensus: {signal_pct}% of weighted signals agree ({direction})")
+
+        # Calculate separate UP and DOWN confidence based on actual signal weights
+        bullish_weight = sum(s.get('weight', 0) for s in conviction_breakdown.get('bullish', []))
+        bearish_weight = sum(s.get('weight', 0) for s in conviction_breakdown.get('bearish', []))
+        total_weight = conviction_breakdown.get('total_weight', bullish_weight + bearish_weight)
+
+        if total_weight > 0:
+            confidence_up = int((bullish_weight / total_weight) * 100)
+            confidence_down = int((bearish_weight / total_weight) * 100)
+        else:
+            confidence_up = 0
+            confidence_down = 0
     else:
         confidence = 25  # Default for FLAT or no signals
         reason.append("No clear signal consensus")
+        confidence_up = 25
+        confidence_down = 25
 
     # ── Pivot proximity bonus (+10) ────────────────────────────────
     if d['pivots'] is not None and d['silver'] is not None:
@@ -1525,6 +1749,8 @@ def predict_move(d, minutes, signals=None):
     return {
         "direction": direction,
         "confidence": confidence,
+        "confidence_up": confidence_up,
+        "confidence_down": confidence_down,
         "target_price": target_price,
         "stop_loss": stop_loss,
         "expected_move_pct": expected_move_pct,
@@ -1716,7 +1942,7 @@ def render_signal_history_chart(signal_history):
         return
 
     df_hist = pd.DataFrame(signal_history)
-    df_hist['time_str'] = df_hist['timestamp'].dt.strftime('%H:%M')
+    df_hist['time_str'] = df_hist['timestamp'].apply(lambda x: to_swedish_time(x, '%H:%M'))
 
     fig = go.Figure()
 
@@ -1773,7 +1999,7 @@ def render_signal_history_table(signal_history):
     current_price = df_hist['silver_price'].iloc[-1]
 
     # Format data for display
-    df_hist['time'] = df_hist['timestamp'].dt.strftime('%H:%M:%S')
+    df_hist['time'] = df_hist['timestamp'].apply(lambda x: to_swedish_time(x, '%H:%M:%S'))
     df_hist['price'] = df_hist['silver_price'].apply(lambda x: f"${x:.3f}")
     df_hist['move'] = (df_hist['silver_price'] - current_price).apply(lambda x: f"{x:+.3f}")
     df_hist['alignment'] = df_hist.apply(
@@ -2036,28 +2262,87 @@ def _base_layout(title, height=360, h=1.0):
                     xanchor="left", x=0, font=dict(size=9)))
 
 def chart_candle(df, bb_up, bb_mid, bb_lo, kc_up, kc_lo, vwap, title, h=1.0, pivots=None, ce_long=None):
-    """Candlestick + VWAP + Bollinger + Keltner + optional Pivots + Chandelier Exit."""
+    """Candlestick + VWAP + Bollinger + Keltner + optional Pivots + Chandelier Exit.
+    Automatically excludes weekends, holidays, and any days with missing data."""
+    selected_hours = st.session_state.get('selected_hours', 12)
+
+    # Remove any rows with missing data (holidays, weekends, gaps)
+    df = df.dropna()
+    df = apply_time_filter(df, selected_hours)
+
+    # Drop NaN from all overlay data (bands, VWAP, etc.) to avoid gaps
+    if kc_up is not None:
+        kc_up = kc_up.dropna()
+    if kc_lo is not None:
+        kc_lo = kc_lo.dropna()
+    if bb_up is not None:
+        bb_up = bb_up.dropna()
+    if bb_lo is not None:
+        bb_lo = bb_lo.dropna()
+    if bb_mid is not None:
+        bb_mid = bb_mid.dropna()
+    if vwap is not None:
+        vwap = vwap.dropna()
+
+    # Keep only indices that exist in the cleaned dataframe (no interpolation across gaps)
+    common_idx = df.index.intersection(kc_up.index if kc_up is not None else df.index).intersection(bb_up.index if bb_up is not None else df.index)
+    if vwap is not None:
+        common_idx = common_idx.intersection(vwap.index)
+
+    # Filter all data to only common indices (removes gaps completely)
+    df = df.loc[common_idx]
+    if kc_up is not None:
+        kc_up = kc_up.loc[common_idx]
+    if kc_lo is not None:
+        kc_lo = kc_lo.loc[common_idx]
+    if bb_up is not None:
+        bb_up = bb_up.loc[common_idx]
+    if bb_lo is not None:
+        bb_lo = bb_lo.loc[common_idx]
+    if bb_mid is not None:
+        bb_mid = bb_mid.loc[common_idx]
+    if vwap is not None:
+        vwap = vwap.loc[common_idx]
+
+    # Use numeric x-axis (0, 1, 2, 3...) to eliminate gaps. Store datetime for labels (in Swedish time).
+    x_numeric = list(range(len(df)))
+    x_dates = [to_swedish_time(ts, '%Y-%m-%d %H:%M') for ts in df.index]
+
+    # Create custom tick positions: every N-th label to avoid crowding
+    tick_interval = max(1, len(df) // 6)  # Show ~6 labels
+    tick_positions = list(range(0, len(df), tick_interval))
+    if len(df) - 1 not in tick_positions:
+        tick_positions.append(len(df) - 1)
+    tick_labels = [x_dates[i] if i < len(x_dates) else "" for i in tick_positions]
+
     fig = go.Figure()
 
     # KC outer fill (orange for visibility on white)
-    fig.add_trace(go.Scatter(x=df.index, y=kc_up.reindex(df.index, method='nearest', tolerance=pd.Timedelta('6min')),
-                             line=dict(color="rgba(255,140,0,0.5)", width=1),
-                             name="KC Upper", showlegend=True))
-    fig.add_trace(go.Scatter(x=df.index, y=kc_lo.reindex(df.index, method='nearest', tolerance=pd.Timedelta('6min')),
-                             line=dict(color="rgba(255,140,0,0.5)", width=1),
-                             fill="tonexty", fillcolor="rgba(255,140,0,0.08)",
-                             name="KC Lower", showlegend=True))
+    if kc_up is not None and kc_lo is not None:
+        fig.add_trace(go.Scatter(x=x_numeric, y=kc_up,
+                                 line=dict(color="rgba(255,140,0,0.5)", width=1),
+                                 name="KC Upper", showlegend=True, hovertemplate="<b>%{text}</b><br>KC: %{y:.2f}<extra></extra>",
+                                 text=x_dates))
+        fig.add_trace(go.Scatter(x=x_numeric, y=kc_lo,
+                                 line=dict(color="rgba(255,140,0,0.5)", width=1),
+                                 fill="tonexty", fillcolor="rgba(255,140,0,0.08)",
+                                 name="KC Lower", showlegend=True, hovertemplate="<b>%{text}</b><br>KC: %{y:.2f}<extra></extra>",
+                                 text=x_dates))
     # BB fill (blue for visibility on white)
-    fig.add_trace(go.Scatter(x=df.index, y=bb_up.reindex(df.index, method='nearest', tolerance=pd.Timedelta('6min')),
-                             line=dict(color="rgba(50,130,200,0.6)", width=1),
-                             name="BB Upper", showlegend=True))
-    fig.add_trace(go.Scatter(x=df.index, y=bb_lo.reindex(df.index, method='nearest', tolerance=pd.Timedelta('6min')),
-                             line=dict(color="rgba(50,130,200,0.6)", width=1),
-                             fill="tonexty", fillcolor="rgba(50,130,200,0.12)",
-                             name="BB Lower", showlegend=True))
-    fig.add_trace(go.Scatter(x=df.index, y=bb_mid.reindex(df.index, method='nearest', tolerance=pd.Timedelta('6min')),
-                             line=dict(color="rgba(50,130,200,0.8)", width=1, dash="dot"),
-                             name="BB Mid", showlegend=True))
+    if bb_up is not None and bb_lo is not None and bb_mid is not None:
+        fig.add_trace(go.Scatter(x=x_numeric, y=bb_up,
+                                 line=dict(color="rgba(50,130,200,0.6)", width=1),
+                                 name="BB Upper", showlegend=True, hovertemplate="<b>%{text}</b><br>BB: %{y:.2f}<extra></extra>",
+                                 text=x_dates))
+        fig.add_trace(go.Scatter(x=x_numeric, y=bb_lo,
+                                 line=dict(color="rgba(50,130,200,0.6)", width=1),
+                                 fill="tonexty", fillcolor="rgba(50,130,200,0.12)",
+                                 name="BB Lower", showlegend=True, hovertemplate="<b>%{text}</b><br>BB: %{y:.2f}<extra></extra>",
+                                 text=x_dates))
+        fig.add_trace(go.Scatter(x=x_numeric, y=bb_mid,
+                                 line=dict(color="rgba(50,130,200,0.8)", width=1, dash="dot"),
+                                 name="BB Mid", showlegend=True, hovertemplate="<b>%{text}</b><br>BB Mid: %{y:.2f}<extra></extra>",
+                                 text=x_dates))
 
     # Pivot points (if provided)
     if pivots is not None:
@@ -2069,45 +2354,88 @@ def chart_candle(df, bb_up, bb_mid, bb_lo, kc_up, kc_lo, vwap, title, h=1.0, piv
             ("S2", "rgba(30,150,30,0.7)", "S2"),
         ]:
             if key in pivots and not pivots[key].empty:
-                s = pivots[key].reindex(df.index, method='nearest', tolerance=pd.Timedelta('30min'))
-                fig.add_trace(go.Scatter(x=df.index, y=s,
-                                         line=dict(color=color, width=1, dash="dash"),
-                                         name=label, showlegend=True))
+                s = pivots[key].dropna()
+                # Only use pivot values that exist in our cleaned data
+                s = s.loc[s.index.intersection(df.index)]
+                if not s.empty:
+                    # Map datetime indices to numeric positions
+                    pivot_x_numeric = [i for i, d in enumerate(df.index) if d in s.index]
+                    pivot_y = s.values
+                    pivot_text = [to_swedish_time(ts, '%Y-%m-%d %H:%M') for ts in s.index]
+                    fig.add_trace(go.Scatter(x=pivot_x_numeric, y=pivot_y,
+                                             line=dict(color=color, width=1, dash="dash"),
+                                             name=label, showlegend=True,
+                                             hovertemplate="<b>%{text}</b><br>" + label + ": %{y:.2f}<extra></extra>",
+                                             text=pivot_text))
 
     # Chandelier Exit (if provided)
     if ce_long is not None and not ce_long.empty:
-        ce_s = ce_long.reindex(df.index, method='nearest', tolerance=pd.Timedelta('6min'))
-        fig.add_trace(go.Scatter(x=df.index, y=ce_s,
-                                 line=dict(color=COL_BEAR, width=1.5, dash="dash"),
-                                 name="Chandelier Exit Long Stop", showlegend=True))
+        ce_s = ce_long.dropna()
+        # Only use CE values that exist in our cleaned data
+        ce_s = ce_s.loc[ce_s.index.intersection(df.index)]
+        if not ce_s.empty:
+            # Map datetime indices to numeric positions
+            ce_x_numeric = [i for i, d in enumerate(df.index) if d in ce_s.index]
+            ce_y = ce_s.values
+            ce_text = [to_swedish_time(ts, '%Y-%m-%d %H:%M') for ts in ce_s.index]
+            fig.add_trace(go.Scatter(x=ce_x_numeric, y=ce_y,
+                                     line=dict(color=COL_BEAR, width=1.5, dash="dash"),
+                                     name="Chandelier Exit Long Stop", showlegend=True,
+                                     hovertemplate="<b>%{text}</b><br>Chandelier Exit: %{y:.2f}<extra></extra>",
+                                     text=ce_text))
 
-    # VWAP
-    fig.add_trace(go.Scatter(x=df.index, y=vwap.reindex(df.index, method='nearest', tolerance=pd.Timedelta('6min')),
-                             line=dict(color=COL_VWAP, width=1.5, dash="dash"),
-                             name="VWAP"))
+    # VWAP (optional)
+    if vwap is not None:
+        fig.add_trace(go.Scatter(x=x_numeric, y=vwap,
+                                 line=dict(color=COL_VWAP, width=1.5, dash="dash"),
+                                 name="VWAP", hovertemplate="<b>%{text}</b><br>VWAP: %{y:.2f}<extra></extra>",
+                                 text=x_dates))
 
     # Candles
     fig.add_trace(go.Candlestick(
-        x=df.index, open=df['Open'], high=df['High'],
+        x=x_numeric, open=df['Open'], high=df['High'],
         low=df['Low'], close=df['Close'],
         increasing_line_color=COL_BULL, decreasing_line_color=COL_BEAR,
-        name="Silver"))
+        name="Silver", hovertext=x_dates, hovertemplate="<b>%{hovertext}</b><br>O: %{open:.2f}<br>H: %{high:.2f}<br>L: %{low:.2f}<br>C: %{close:.2f}<extra></extra>"))
 
     fig.update_layout(**_base_layout(title, h=h))
-    fig.update_yaxes(range=y_pad([df['High'], df['Low'],
-                                   bb_up.reindex(df.index, method='nearest', tolerance=pd.Timedelta('6min')),
-                     bb_lo.reindex(df.index, method='nearest', tolerance=pd.Timedelta('6min'))]),
+    fig.update_xaxes(tickvals=tick_positions, ticktext=tick_labels, gridcolor=GRID_COL)
+
+    # Y-axis range calculation - include only non-None series
+    y_series = [df['High'], df['Low']]
+    if bb_up is not None:
+        y_series.append(bb_up)
+    if bb_lo is not None:
+        y_series.append(bb_lo)
+    if kc_up is not None:
+        y_series.append(kc_up)
+    if kc_lo is not None:
+        y_series.append(kc_lo)
+
+    fig.update_yaxes(range=y_pad(y_series),
                      tickformat=".2f", gridcolor=GRID_COL)
     return fig
 
 def chart_rsi_triple(d, h=1.0):
-    """3-panel RSI: 5m, 1h, 4h."""
+    """3-panel RSI: 15m, 1h, 4h."""
     fig = make_subplots(rows=1, cols=3,
-                        subplot_titles=("RSI 14 — 5 Min", "RSI 14 — 1 Hour", "RSI 14 — 4 Hour"),
+                        subplot_titles=("RSI 14 — 15 Min", "RSI 14 — 1 Hour", "RSI 14 — 4 Hour"),
                         horizontal_spacing=0.08)
+    selected_hours = st.session_state.get('selected_hours', 12)
     for col, (key, label) in enumerate([
-            ("rsi_5m", "5m"), ("rsi_1h", "1h"), ("rsi_4h", "4h")], 1):
+            ("rsi_15m", "15m"), ("rsi_1h", "1h"), ("rsi_4h", "4h")], 1):
         s = d['chart'][key].dropna()
+        s = apply_time_filter(s, selected_hours)
+
+        # Use numeric x-axis to eliminate gaps
+        x_numeric = list(range(len(s)))
+        s_dates = [to_swedish_time(idx) for idx in s.index]
+
+        # Generate x-axis time labels (every nth to avoid crowding)
+        label_interval = max(1, len(s) // 6)  # Show ~6 labels per panel
+        label_indices = [i for i in range(len(s)) if i % label_interval == 0]
+        label_times = [to_swedish_time(s.index[i]) for i in label_indices]
+
         fig.add_hrect(y0=70, y1=100, row=1, col=col,
                       fillcolor="rgba(255,80,80,0.07)", line_width=0)
         fig.add_hrect(y0=0, y1=30, row=1, col=col,
@@ -2120,82 +2448,125 @@ def chart_rsi_triple(d, h=1.0):
                       line=dict(color=COL_BULL, dash="dot", width=1),
                       annotation_text="Oversold", annotation_position="bottom left",
                       annotation_font=dict(size=9, color=COL_BULL))
-        fig.add_trace(go.Scatter(x=s.index, y=s,
+        fig.add_trace(go.Scatter(x=x_numeric, y=s,
                                  line=dict(color="#0066CC", width=2),
-                                 name=f"RSI {label}", showlegend=False), row=1, col=col)
+                                 name=f"RSI {label}", showlegend=False, hovertext=s_dates, hovertemplate="<b>%{hovertext}</b><br>RSI: %{y:.1f}<extra></extra>"), row=1, col=col)
+
+        # Update x-axis for this panel with time labels
+        fig.update_xaxes(gridcolor=GRID_COL, ticktext=label_times, tickvals=label_indices, row=1, col=col)
     fig.update_yaxes(range=[0, 100], tickformat=".0f", gridcolor=GRID_COL)
-    fig.update_xaxes(gridcolor=GRID_COL)
     fig.update_layout(height=int(260 * h), plot_bgcolor=PLOT_BG, paper_bgcolor=PLOT_BG,
                       margin=dict(l=10, r=10, t=50, b=10))
     return fig
 
 def chart_advanced_oscillators(d, h=1.0):
     """
-    6-panel advanced oscillators: StochRSI, Williams%R, MFI on 5m and 1h.
+    6-panel advanced oscillators: StochRSI, Williams%R, MFI on 15m (entry) and 1h (confirmation) levels.
     Shows overbought/oversold zones and provides volume-weighted signals.
     """
+    selected_hours = st.session_state.get('selected_hours', 12)
+
     fig = make_subplots(rows=2, cols=3,
                         subplot_titles=(
-                            "StochRSI 5m", "Williams %R 5m", "MFI 5m",
+                            "StochRSI 15m", "Williams %R 15m", "MFI 15m",
                             "StochRSI 1h", "Williams %R 1h", "MFI 1h"
                         ),
                         vertical_spacing=0.15, horizontal_spacing=0.08)
 
-    # Row 1: 5m oscillators
-    # StochRSI 5m
-    sr5 = d['chart']['stoch_rsi_5m'].dropna()
+    # Row 1: 15m oscillators (entry-level precision)
+    # StochRSI 15m
+    sr15 = apply_time_filter(d['chart']['stoch_rsi_15m'].dropna(), selected_hours)
+    sr15_x = list(range(len(sr15)))
+    sr15_dates = [to_swedish_time(idx) for idx in sr15.index]
     fig.add_hrect(y0=80, y1=100, row=1, col=1, fillcolor="rgba(255,80,80,0.07)", line_width=0)
     fig.add_hrect(y0=0, y1=20, row=1, col=1, fillcolor="rgba(80,255,80,0.07)", line_width=0)
     fig.add_hline(y=80, row=1, col=1, line=dict(color=COL_BEAR, dash="dot", width=1))
     fig.add_hline(y=20, row=1, col=1, line=dict(color=COL_BULL, dash="dot", width=1))
-    fig.add_trace(go.Scatter(x=sr5.index, y=sr5, line=dict(color=COL_STOCH, width=2),
-                             name="StochRSI 5m", showlegend=False), row=1, col=1)
+    fig.add_trace(go.Scatter(x=sr15_x, y=sr15, line=dict(color=COL_STOCH, width=2),
+                             name="StochRSI 15m", showlegend=False, hovertext=sr15_dates, hovertemplate="<b>%{hovertext}</b><br>%{y:.1f}<extra></extra>"), row=1, col=1)
 
-    # Williams %R 5m
-    wr5 = d['chart']['williams_r_5m'].dropna()
+    # Williams %R 15m
+    wr15 = apply_time_filter(d['chart']['williams_r_15m'].dropna(), selected_hours)
+    wr15_x = list(range(len(wr15)))
+    wr15_dates = [to_swedish_time(idx) for idx in wr15.index]
     fig.add_hrect(y0=-20, y1=0, row=1, col=2, fillcolor="rgba(255,80,80,0.07)", line_width=0)
     fig.add_hrect(y0=-100, y1=-80, row=1, col=2, fillcolor="rgba(80,255,80,0.07)", line_width=0)
     fig.add_hline(y=-20, row=1, col=2, line=dict(color=COL_BEAR, dash="dot", width=1))
     fig.add_hline(y=-80, row=1, col=2, line=dict(color=COL_BULL, dash="dot", width=1))
-    fig.add_trace(go.Scatter(x=wr5.index, y=wr5, line=dict(color="#CC0000", width=2),
-                             name="Williams %R 5m", showlegend=False), row=1, col=2)
+    fig.add_trace(go.Scatter(x=wr15_x, y=wr15, line=dict(color="#CC0000", width=2),
+                             name="Williams %R 15m", showlegend=False, hovertext=wr15_dates, hovertemplate="<b>%{hovertext}</b><br>%{y:.1f}<extra></extra>"), row=1, col=2)
 
-    # MFI 5m
-    mfi5 = d['chart']['mfi_5m'].dropna()
+    # MFI 15m (entry-level precision)
+    mfi15 = apply_time_filter(d['chart']['mfi_15m'].dropna(), selected_hours)
+    mfi15_x = list(range(len(mfi15)))
+    mfi15_dates = [to_swedish_time(idx) for idx in mfi15.index]
     fig.add_hrect(y0=80, y1=100, row=1, col=3, fillcolor="rgba(255,80,80,0.07)", line_width=0)
     fig.add_hrect(y0=0, y1=20, row=1, col=3, fillcolor="rgba(80,255,80,0.07)", line_width=0)
     fig.add_hline(y=80, row=1, col=3, line=dict(color=COL_BEAR, dash="dot", width=1))
     fig.add_hline(y=20, row=1, col=3, line=dict(color=COL_BULL, dash="dot", width=1))
-    fig.add_trace(go.Scatter(x=mfi5.index, y=mfi5, line=dict(color=COL_MFI, width=2),
-                             name="MFI 5m", showlegend=False), row=1, col=3)
+    fig.add_trace(go.Scatter(x=mfi15_x, y=mfi15, line=dict(color=COL_MFI, width=2),
+                             name="MFI 15m", showlegend=False, hovertext=mfi15_dates, hovertemplate="<b>%{hovertext}</b><br>%{y:.1f}<extra></extra>"), row=1, col=3)
 
     # Row 2: 1h oscillators
     # StochRSI 1h
-    sr1 = d['chart']['stoch_rsi_1h'].dropna()
+    sr1 = apply_time_filter(d['chart']['stoch_rsi_1h'].dropna(), selected_hours)
+    sr1_x = list(range(len(sr1)))
+    sr1_dates = [to_swedish_time(idx) for idx in sr1.index]
     fig.add_hrect(y0=80, y1=100, row=2, col=1, fillcolor="rgba(255,80,80,0.07)", line_width=0)
     fig.add_hrect(y0=0, y1=20, row=2, col=1, fillcolor="rgba(80,255,80,0.07)", line_width=0)
     fig.add_hline(y=80, row=2, col=1, line=dict(color=COL_BEAR, dash="dot", width=1))
     fig.add_hline(y=20, row=2, col=1, line=dict(color=COL_BULL, dash="dot", width=1))
-    fig.add_trace(go.Scatter(x=sr1.index, y=sr1, line=dict(color=COL_STOCH, width=2),
-                             name="StochRSI 1h", showlegend=False), row=2, col=1)
+    fig.add_trace(go.Scatter(x=sr1_x, y=sr1, line=dict(color=COL_STOCH, width=2),
+                             name="StochRSI 1h", showlegend=False, hovertext=sr1_dates, hovertemplate="<b>%{hovertext}</b><br>%{y:.1f}<extra></extra>"), row=2, col=1)
 
     # Williams %R 1h
-    wr1 = d['chart']['williams_r_1h'].dropna()
+    wr1 = apply_time_filter(d['chart']['williams_r_1h'].dropna(), selected_hours)
+    wr1_x = list(range(len(wr1)))
+    wr1_dates = [to_swedish_time(idx) for idx in wr1.index]
     fig.add_hrect(y0=-20, y1=0, row=2, col=2, fillcolor="rgba(255,80,80,0.07)", line_width=0)
     fig.add_hrect(y0=-100, y1=-80, row=2, col=2, fillcolor="rgba(80,255,80,0.07)", line_width=0)
     fig.add_hline(y=-20, row=2, col=2, line=dict(color=COL_BEAR, dash="dot", width=1))
     fig.add_hline(y=-80, row=2, col=2, line=dict(color=COL_BULL, dash="dot", width=1))
-    fig.add_trace(go.Scatter(x=wr1.index, y=wr1, line=dict(color="#CC0000", width=2),
-                             name="Williams %R 1h", showlegend=False), row=2, col=2)
+    fig.add_trace(go.Scatter(x=wr1_x, y=wr1, line=dict(color="#CC0000", width=2),
+                             name="Williams %R 1h", showlegend=False, hovertext=wr1_dates, hovertemplate="<b>%{hovertext}</b><br>%{y:.1f}<extra></extra>"), row=2, col=2)
 
     # MFI 1h
-    mfi1 = d['chart']['mfi_1h'].dropna()
+    mfi1 = apply_time_filter(d['chart']['mfi_1h'].dropna(), selected_hours)
+    mfi1_x = list(range(len(mfi1)))
+    mfi1_dates = [to_swedish_time(idx) for idx in mfi1.index]
     fig.add_hrect(y0=80, y1=100, row=2, col=3, fillcolor="rgba(255,80,80,0.07)", line_width=0)
     fig.add_hrect(y0=0, y1=20, row=2, col=3, fillcolor="rgba(80,255,80,0.07)", line_width=0)
     fig.add_hline(y=80, row=2, col=3, line=dict(color=COL_BEAR, dash="dot", width=1))
     fig.add_hline(y=20, row=2, col=3, line=dict(color=COL_BULL, dash="dot", width=1))
-    fig.add_trace(go.Scatter(x=mfi1.index, y=mfi1, line=dict(color=COL_MFI, width=2),
-                             name="MFI 1h", showlegend=False), row=2, col=3)
+    fig.add_trace(go.Scatter(x=mfi1_x, y=mfi1, line=dict(color=COL_MFI, width=2),
+                             name="MFI 1h", showlegend=False, hovertext=mfi1_dates, hovertemplate="<b>%{hovertext}</b><br>%{y:.1f}<extra></extra>"), row=2, col=3)
+
+    # Generate x-axis time labels for each oscillator
+    # Row 1 (15m oscillators)
+    sr15_label_interval = max(1, len(sr15) // 4)
+    sr15_label_indices = [i for i in range(len(sr15)) if i % sr15_label_interval == 0]
+    sr15_label_times = [to_swedish_time(sr15.index[i]) for i in sr15_label_indices]
+
+    wr15_label_interval = max(1, len(wr15) // 4)
+    wr15_label_indices = [i for i in range(len(wr15)) if i % wr15_label_interval == 0]
+    wr15_label_times = [to_swedish_time(wr15.index[i]) for i in wr15_label_indices]
+
+    mfi15_label_interval = max(1, len(mfi15) // 4)
+    mfi15_label_indices = [i for i in range(len(mfi15)) if i % mfi15_label_interval == 0]
+    mfi15_label_times = [to_swedish_time(mfi15.index[i]) for i in mfi15_label_indices]
+
+    # Row 2 (1h oscillators)
+    sr1_label_interval = max(1, len(sr1) // 4)
+    sr1_label_indices = [i for i in range(len(sr1)) if i % sr1_label_interval == 0]
+    sr1_label_times = [to_swedish_time(sr1.index[i]) for i in sr1_label_indices]
+
+    wr1_label_interval = max(1, len(wr1) // 4)
+    wr1_label_indices = [i for i in range(len(wr1)) if i % wr1_label_interval == 0]
+    wr1_label_times = [to_swedish_time(wr1.index[i]) for i in wr1_label_indices]
+
+    mfi1_label_interval = max(1, len(mfi1) // 4)
+    mfi1_label_indices = [i for i in range(len(mfi1)) if i % mfi1_label_interval == 0]
+    mfi1_label_times = [to_swedish_time(mfi1.index[i]) for i in mfi1_label_indices]
 
     fig.update_yaxes(row=1, col=1, range=[0, 100], tickformat=".0f", gridcolor=GRID_COL)
     fig.update_yaxes(row=1, col=2, range=[-100, 0], tickformat=".0f", gridcolor=GRID_COL)
@@ -2203,23 +2574,46 @@ def chart_advanced_oscillators(d, h=1.0):
     fig.update_yaxes(row=2, col=1, range=[0, 100], tickformat=".0f", gridcolor=GRID_COL)
     fig.update_yaxes(row=2, col=2, range=[-100, 0], tickformat=".0f", gridcolor=GRID_COL)
     fig.update_yaxes(row=2, col=3, range=[0, 100], tickformat=".0f", gridcolor=GRID_COL)
-    fig.update_xaxes(gridcolor=GRID_COL)
+
+    # Update x-axes with time labels for each panel
+    fig.update_xaxes(gridcolor=GRID_COL, ticktext=sr15_label_times, tickvals=sr15_label_indices, row=1, col=1)
+    fig.update_xaxes(gridcolor=GRID_COL, ticktext=wr15_label_times, tickvals=wr15_label_indices, row=1, col=2)
+    fig.update_xaxes(gridcolor=GRID_COL, ticktext=mfi15_label_times, tickvals=mfi15_label_indices, row=1, col=3)
+    fig.update_xaxes(gridcolor=GRID_COL, ticktext=sr1_label_times, tickvals=sr1_label_indices, row=2, col=1)
+    fig.update_xaxes(gridcolor=GRID_COL, ticktext=wr1_label_times, tickvals=wr1_label_indices, row=2, col=2)
+    fig.update_xaxes(gridcolor=GRID_COL, ticktext=mfi1_label_times, tickvals=mfi1_label_indices, row=2, col=3)
+
     fig.update_layout(height=int(380 * h), plot_bgcolor=PLOT_BG, paper_bgcolor=PLOT_BG,
                       margin=dict(l=10, r=10, t=60, b=10))
     return fig
 
 def chart_macd_panel(hist_key, line_key, sig_key, title, d, h=1.0):
     """MACD chart for a given timeframe."""
-    ml  = d['chart'][line_key].dropna()
-    ms  = d['chart'][sig_key].dropna()
-    mh  = d['chart'][hist_key].dropna()
+    selected_hours = st.session_state.get('selected_hours', 12)
+    ml  = apply_time_filter(d['chart'][line_key].dropna(), selected_hours)
+    ms  = apply_time_filter(d['chart'][sig_key].dropna(), selected_hours)
+    mh  = apply_time_filter(d['chart'][hist_key].dropna(), selected_hours)
     colors = [COL_BULL if v >= 0 else COL_BEAR for v in mh]
+
+    # Use numeric x-axis to eliminate gaps, but add datetime labels
+    ml_x = list(range(len(ml)))
+    ms_x = list(range(len(ms)))
+    mh_x = list(range(len(mh)))
+
+    # Create custom x-axis labels with datetime info (every nth label to avoid crowding)
+    mh_dates = mh.index
+    label_interval = max(1, len(mh_dates) // 10)  # Show ~10 labels
+
+    # Calculate actual label positions and times (in Swedish timezone)
+    label_indices = [i for i in range(len(mh_dates)) if i % label_interval == 0]
+    label_times = [to_swedish_time(mh_dates[i]) for i in label_indices]
+
     fig = make_subplots(rows=2, cols=1, row_heights=[0.55, 0.45],
                         shared_xaxes=True, vertical_spacing=0.12,
                         subplot_titles=(f"{title} Line", "Histogram"))
-    fig.add_trace(go.Scatter(x=ml.index, y=ml, line=dict(color=COL_MACD, width=2),
+    fig.add_trace(go.Scatter(x=ml_x, y=ml, line=dict(color=COL_MACD, width=2),
                              name="MACD"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=ms.index, y=ms, line=dict(color=COL_NEUT, width=1.5, dash="dash"),
+    fig.add_trace(go.Scatter(x=ms_x, y=ms, line=dict(color=COL_NEUT, width=1.5, dash="dash"),
                              name="Signal"), row=1, col=1)
     fig.add_hline(y=0, row=1, col=1, line=dict(color=GRID_COL, width=1),
                   annotation_text="Zero line", annotation_position="top left",
@@ -2227,10 +2621,10 @@ def chart_macd_panel(hist_key, line_key, sig_key, title, d, h=1.0):
     fig.add_hline(y=0, row=2, col=1, line=dict(color=GRID_COL, width=1),
                   annotation_text="↑ Bullish  ↓ Bearish", annotation_position="top right",
                   annotation_font=dict(size=9, color="#888"))
-    fig.add_trace(go.Bar(x=mh.index, y=mh, marker_color=colors,
+    fig.add_trace(go.Bar(x=mh_x, y=mh, marker_color=colors,
                          name="Histogram", showlegend=False), row=2, col=1)
     fig.update_yaxes(gridcolor=GRID_COL)
-    fig.update_xaxes(gridcolor=GRID_COL)
+    fig.update_xaxes(gridcolor=GRID_COL, ticktext=label_times, tickvals=label_indices)
     fig.update_layout(height=int(280 * h), plot_bgcolor=PLOT_BG, paper_bgcolor=PLOT_BG,
                       margin=dict(l=10, r=10, t=55, b=10),
                       title=title,
@@ -2239,59 +2633,127 @@ def chart_macd_panel(hist_key, line_key, sig_key, title, d, h=1.0):
     return fig
 
 def chart_adx_panel(adx_key, dip_key, dim_key, title, d, h=1.0):
-    """ADX + DI lines for a given timeframe."""
-    adx_s = d['chart'][adx_key].dropna()
-    di_p  = d['chart'][dip_key].dropna()
-    di_m  = d['chart'][dim_key].dropna()
+    """ADX + DI lines for a given timeframe with enhanced visuals."""
+    selected_hours = st.session_state.get('selected_hours', 12)
+    adx_s = apply_time_filter(d['chart'][adx_key].dropna(), selected_hours)
+    di_p  = apply_time_filter(d['chart'][dip_key].dropna(), selected_hours)
+    di_m  = apply_time_filter(d['chart'][dim_key].dropna(), selected_hours)
+
+    # Use numeric x-axis to eliminate gaps, but add datetime labels
+    adx_x = list(range(len(adx_s)))
+    di_p_x = list(range(len(di_p)))
+    di_m_x = list(range(len(di_m)))
+
+    # Create custom x-axis labels with datetime info (every nth label to avoid crowding)
+    adx_dates = adx_s.index
+    label_interval = max(1, len(adx_dates) // 10)  # Show ~10 labels
+
+    # Calculate actual label positions and times (in Swedish timezone)
+    label_indices = [i for i in range(len(adx_dates)) if i % label_interval == 0]
+    label_times = [to_swedish_time(adx_dates[i]) for i in label_indices]
+
+    # Get current values for annotations
+    current_adx = float(adx_s.iloc[-1]) if len(adx_s) > 0 else 0
+    current_di_p = float(di_p.iloc[-1]) if len(di_p) > 0 else 0
+    current_di_m = float(di_m.iloc[-1]) if len(di_m) > 0 else 0
+
     fig = go.Figure()
-    fig.add_hrect(y0=25, y1=100, fillcolor="rgba(100,255,100,0.04)", line_width=0)
-    fig.add_hline(y=25, line=dict(color=COL_BULL, dash="dot", width=1),
-                  annotation_text="25 — Trending")
-    fig.add_hline(y=15, line=dict(color=COL_NEUT, dash="dot", width=1),
-                  annotation_text="15 — Developing")
-    fig.add_trace(go.Scatter(x=adx_s.index, y=adx_s,
-                             line=dict(color="#0066CC", width=2), name="ADX"))
-    fig.add_trace(go.Scatter(x=di_p.index, y=di_p,
-                             line=dict(color=COL_BULL, width=1.5), name="+DI"))
-    fig.add_trace(go.Scatter(x=di_m.index, y=di_m,
-                             line=dict(color=COL_BEAR, width=1.5), name="-DI"))
-    fig.update_layout(**_base_layout(title, 260, h=h))
-    fig.update_yaxes(range=y_pad([adx_s, di_p, di_m], 0.1), gridcolor=GRID_COL)
+
+    # Background zones for trend strength
+    fig.add_hrect(y0=35, y1=100, fillcolor="rgba(0,221,0,0.06)", line_width=0, name="Very Strong")
+    fig.add_hrect(y0=25, y1=35, fillcolor="rgba(0,221,0,0.03)", line_width=0, name="Strong Trend")
+    fig.add_hrect(y0=15, y1=25, fillcolor="rgba(255,150,0,0.03)", line_width=0, name="Developing")
+    fig.add_hrect(y0=0, y1=15, fillcolor="rgba(200,200,200,0.03)", line_width=0, name="Ranging")
+
+    # Threshold lines
+    fig.add_hline(y=35, line=dict(color="#00AA00", dash="solid", width=1.5),
+                  annotation_text="35 — Very Strong", annotation_position="right")
+    fig.add_hline(y=25, line=dict(color=COL_BULL, dash="dot", width=1.5),
+                  annotation_text="25 — Trending", annotation_position="right")
+    fig.add_hline(y=15, line=dict(color=COL_NEUT, dash="dot", width=1.5),
+                  annotation_text="15 — Developing", annotation_position="right")
+
+    # Main ADX line (thicker, more prominent)
+    fig.add_trace(go.Scatter(x=adx_x, y=adx_s,
+                             line=dict(color="#0066CC", width=2.5), name="ADX",
+                             hovertemplate="<b>ADX</b><br>%{y:.1f}<extra></extra>"))
+
+    # DI+ line (bullish)
+    fig.add_trace(go.Scatter(x=di_p_x, y=di_p,
+                             line=dict(color=COL_BULL, width=1.5, dash="solid"), name="+DI (Bullish)",
+                             hovertemplate="<b>+DI</b><br>%{y:.1f}<extra></extra>"))
+
+    # DI- line (bearish)
+    fig.add_trace(go.Scatter(x=di_m_x, y=di_m,
+                             line=dict(color=COL_BEAR, width=1.5, dash="solid"), name="-DI (Bearish)",
+                             hovertemplate="<b>-DI</b><br>%{y:.1f}<extra></extra>"))
+
+    fig.update_layout(**_base_layout(title, 280, h=h))
+    fig.update_xaxes(ticktext=label_times, tickvals=label_indices)
+    fig.update_yaxes(range=y_pad([adx_s, di_p, di_m], 0.15), gridcolor=GRID_COL)
+
+    # Add annotations for current values on the right side
+    fig.add_annotation(x=len(adx_x)-1, y=current_adx,
+                      text=f"ADX: {current_adx:.1f}", showarrow=False,
+                      xanchor="left", xshift=10, bgcolor="rgba(0,102,204,0.8)",
+                      font=dict(color="white", size=11), borderpad=4)
+
     return fig
 
 def chart_obv_panel(obv_key, ma_key, title, d, h=1.0):
     """OBV + MA."""
-    obv   = d['chart'][obv_key].dropna()
-    obv_m = d['chart'][ma_key].dropna()
+    selected_hours = st.session_state.get('selected_hours', 12)
+    obv   = apply_time_filter(d['chart'][obv_key].dropna(), selected_hours)
+    obv_m = apply_time_filter(d['chart'][ma_key].dropna(), selected_hours)
+
+    # Use numeric x-axis to eliminate gaps
+    obv_x = list(range(len(obv)))
+    obv_m_x = list(range(len(obv_m)))
+    obv_dates = [to_swedish_time(idx) for idx in obv.index]
+    obv_m_dates = [to_swedish_time(idx) for idx in obv_m.index]
+
+    # Generate x-axis time labels
+    label_interval = max(1, len(obv) // 6)
+    label_indices = [i for i in range(len(obv)) if i % label_interval == 0]
+    label_times = [to_swedish_time(obv.index[i]) for i in label_indices]
+
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=obv.index, y=obv,
-                             line=dict(color=COL_OBV, width=2), name="OBV"))
-    fig.add_trace(go.Scatter(x=obv_m.index, y=obv_m,
-                             line=dict(color=COL_NEUT, width=1.5, dash="dash"), name="OBV MA"))
+    fig.add_trace(go.Scatter(x=obv_x, y=obv,
+                             line=dict(color=COL_OBV, width=2), name="OBV", hovertext=obv_dates, hovertemplate="<b>%{hovertext}</b><br>%{y:,.0f}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=obv_m_x, y=obv_m,
+                             line=dict(color=COL_NEUT, width=1.5, dash="dash"), name="OBV MA", hovertext=obv_m_dates, hovertemplate="<b>%{hovertext}</b><br>%{y:,.0f}<extra></extra>"))
     fig.update_layout(**_base_layout(title, 240, h=h))
     fig.update_yaxes(range=y_pad([obv, obv_m]), gridcolor=GRID_COL)
+    fig.update_xaxes(ticktext=label_times, tickvals=label_indices, gridcolor=GRID_COL)
     return fig
 
 def chart_dxy_gs(d, h=1.0):
     """DXY, G/S ratio, and Platinum — side by side."""
+    selected_hours = st.session_state.get('selected_hours', 12)
     has_pt   = d.get('platinum') is not None and not d['chart']['pt1h'].empty
     ncols    = 3 if has_pt else 2
-    subtitles = ["US Dollar Index (DXY) — 1h", "Gold/Silver Ratio — 1h"]
+    subtitles = ["US Dollar Index (DXY) — 15 Min", "Gold/Silver Ratio — 1h"]
     if has_pt:
         subtitles.append("Platinum (PL) vs MA20h — 1h")
     fig = make_subplots(rows=1, cols=ncols, subplot_titles=subtitles, horizontal_spacing=0.08)
 
-    dxy_s = d['chart']['dxy1h']['Close'].dropna()
-    gs_s  = d['chart']['gs_ratio'].dropna()
+    dxy_s = apply_time_filter(d['chart']['dxy15m']['Close'].dropna(), selected_hours)
+    gs_s  = apply_time_filter(d['chart']['gs_ratio'].dropna(), selected_hours)
+
+    # Use numeric x-axis to eliminate gaps
+    dxy_x = list(range(len(dxy_s)))
+    gs_x = list(range(len(gs_s)))
+    dxy_dates = [to_swedish_time(idx) for idx in dxy_s.index]
+    gs_dates = [to_swedish_time(idx) for idx in gs_s.index]
 
     if d['dxy_ma20']:
         fig.add_hline(y=d['dxy_ma20'], row=1, col=1,
                       line=dict(color="#FF9500", dash="dash", width=1),
                       annotation_text=f"MA20h {d['dxy_ma20']:.2f}",
                       annotation_font=dict(size=9, color="#FF9500"))
-    fig.add_trace(go.Scatter(x=dxy_s.index, y=dxy_s,
+    fig.add_trace(go.Scatter(x=dxy_x, y=dxy_s,
                              line=dict(color=COL_DXY, width=2),
-                             name="DXY", showlegend=False), row=1, col=1)
+                             name="DXY", showlegend=False, hovertext=dxy_dates, hovertemplate="<b>%{hovertext}</b><br>%{y:.2f}<extra></extra>"), row=1, col=1)
 
     fig.add_hline(y=80, row=1, col=2,
                   line=dict(color=COL_BULL, dash="dot", width=1),
@@ -2301,20 +2763,22 @@ def chart_dxy_gs(d, h=1.0):
                   line=dict(color=COL_BEAR, dash="dot", width=1),
                   annotation_text="60 — Silver expensive vs Gold",
                   annotation_font=dict(size=9, color=COL_BEAR))
-    fig.add_trace(go.Scatter(x=gs_s.index, y=gs_s,
+    fig.add_trace(go.Scatter(x=gs_x, y=gs_s,
                              line=dict(color="#9933FF", width=2),
-                             name="G/S Ratio", showlegend=False), row=1, col=2)
+                             name="G/S Ratio", showlegend=False, hovertext=gs_dates, hovertemplate="<b>%{hovertext}</b><br>%{y:.1f}<extra></extra>"), row=1, col=2)
 
     if has_pt:
-        pt_s = d['chart']['pt1h']['Close'].dropna()
+        pt_s = apply_time_filter(d['chart']['pt1h']['Close'].dropna(), selected_hours)
+        pt_x = list(range(len(pt_s)))
+        pt_dates = [to_swedish_time(idx) for idx in pt_s.index]
         if d['pt_ma20']:
             fig.add_hline(y=d['pt_ma20'], row=1, col=3,
                           line=dict(color="#9933FF", dash="dash", width=1),
                           annotation_text=f"MA20h {d['pt_ma20']:.0f}",
                           annotation_font=dict(size=9, color="#9933FF"))
-        fig.add_trace(go.Scatter(x=pt_s.index, y=pt_s,
+        fig.add_trace(go.Scatter(x=pt_x, y=pt_s,
                                  line=dict(color="#9933FF", width=2),
-                                 name="Platinum", showlegend=False), row=1, col=3)
+                                 name="Platinum", showlegend=False, hovertext=pt_dates, hovertemplate="<b>%{hovertext}</b><br>%{y:.0f}<extra></extra>"), row=1, col=3)
         fig.update_yaxes(row=1, col=3, range=y_pad([pt_s]), tickformat=".0f", gridcolor=GRID_COL)
 
     fig.update_yaxes(row=1, col=1, range=y_pad([dxy_s]), tickformat=".2f", gridcolor=GRID_COL)
@@ -2532,7 +2996,7 @@ def regime_assessment(signals, d):
     regimes = {}
     # Get ADX values from d['chart'] (these are series)
     chart = d['chart']
-    for tf, adx_series in [('5m', chart.get('adx_5m')), ('1h', chart.get('adx_1h')), ('4h', chart.get('adx_4h'))]:
+    for tf, adx_series in [('15m', chart.get('adx_15m')), ('1h', chart.get('adx_1h')), ('4h', chart.get('adx_4h'))]:
         if adx_series is not None and len(adx_series) > 0:
             adx_val = float(adx_series.iloc[-1])
             if adx_val > 35:
@@ -2924,7 +3388,7 @@ def render_market_structure(d):
 
     regime_cols = st.columns([1, 1, 1, 1], gap="small")
 
-    for idx, (tf, tf_label) in enumerate([('5m', '5-Min'), ('1h', '1-Hour'), ('4h', '4-Hour'), ('consensus', 'Consensus')]):
+    for idx, (tf, tf_label) in enumerate([('15m', '15-Min'), ('1h', '1-Hour'), ('4h', '4-Hour'), ('consensus', 'Consensus')]):
         with regime_cols[idx]:
             if tf != 'consensus':
                 regime_info = regimes[tf]
@@ -3551,32 +4015,94 @@ def render_analysis_summary(signals, d):
         - Volume (OBV/MFI rising?)
         - VWAP (institutions buying?)
 
-        ✅ **Phase 3 ready?**
-        - At Bollinger Band zone (entry sweet spot?)
-        - RSI in entry zone (timing right?)
-
-        ✅ **Phase 4 context?**
+        ✅ **Phase 3 context?**
         - Platinum/Copper not conflicting
         - No hidden risk flags
 
         **If any Phase fails, skip the trade.**
         """)
 
-    st.markdown(f"<div style='font-size:12px;font-weight:bold;color:{TEXT_PRIMARY};margin-bottom:8px;'>BOTTOM LINE</div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='font-size:12px;font-weight:bold;color:{TEXT_PRIMARY};margin-bottom:8px;'>📋 LLM ANALYSIS PROMPT - Copy below to ask an AI for trading analysis:</div>", unsafe_allow_html=True)
 
-    summary = """
-    Silver is trading in a mild uptrend across all timeframes with moderate trend strength (ADX 25-35).
-    Positive macro correlations with risk-on sentiment and negative DXY pressure support further upside.
-    Key risk: strong resistance at recent highs requires confirmation. Opportunity quality is good with
-    favorable risk/reward ratios (1:1.5 to 1:2.0 across timeframes). Best suited for trend-following entries
-    on pullbacks or breakout confirmation.
-    """
+    # Build comprehensive prompt with all current data
+    current_price = d.get('silver', 'N/A')
+    regime = d.get('regime', 'UNKNOWN')
+    dxy_trend = d.get('dxy_trend', 'N/A')
+    adx_1h = d.get('adx_1h', 'N/A')
+    adx_4h = d.get('adx_4h', 'N/A')
+    rsi_5m = d.get('rsi_5m', 'N/A')
+    rsi_1h = d.get('rsi_1h', 'N/A')
+    rsi_4h = d.get('rsi_4h', 'N/A')
+    macd_15m = d.get('macd_15m', 'N/A')
+    macd_1h = d.get('macd_1h', 'N/A')
+    obv_trend_15m = d.get('obv_15m_trend', 'N/A')
+    obv_trend_1h = d.get('obv_1h_trend', 'N/A')
+    vwap_15m = d.get('vwap_15m', 'N/A')
+    vwap_1h = d.get('vwap_1h', 'N/A')
+    pt_trend = d.get('pt_trend', 'N/A')
+    copper_ratio = d.get('copper_ratio', 'N/A')
+    vol_ratio = d.get('vol_ratio', 'N/A')
+    atr_15m = d.get('atr_15m', 'N/A')
 
-    st.markdown(f"""
-    <div style='background:#FAFAFA;border-radius:8px;padding:12px;border-left:3px solid {TEXT_SECONDARY};'>
-        <div style='font-size:11px;color:{TEXT_PRIMARY};line-height:1.6;'>{summary.strip()}</div>
-    </div>
-    """, unsafe_allow_html=True)
+    # Extract signal verdicts
+    bullish_signals = [s for s in signals if s['score'] > 0]
+    bearish_signals = [s for s in signals if s['score'] < 0]
+    neutral_signals = [s for s in signals if s['score'] == 0]
+
+    llm_prompt = f"""
+SILVER (SI=F) TECHNICAL & MACRO ANALYSIS PROMPT
+Timestamp: {d.get('last_ts', 'N/A')} (Swedish Time)
+Current Price: ${current_price}
+
+═══════════════════════════════════════════════════════════════
+
+MARKET REGIME & MACRO CONTEXT:
+• Trading Regime: {regime}
+• ADX 1h: {adx_1h} | ADX 4h: {adx_4h} (Trend strength)
+• DXY Trend: {dxy_trend}
+• Platinum Trend: {pt_trend}
+• Copper/Gold Ratio: {copper_ratio}
+• Volume Spike Ratio: {vol_ratio}x
+• ATR 15m: ${atr_15m}
+
+═══════════════════════════════════════════════════════════════
+
+MOMENTUM & PRICE ACTION:
+• RSI 5m: {rsi_5m} | 1h: {rsi_1h} | 4h: {rsi_4h}
+• MACD 15m: {macd_15m} | MACD 1h: {macd_1h}
+• OBV Trend 15m: {obv_trend_15m} | 1h: {obv_trend_1h}
+• VWAP 15m: ${vwap_15m} | 1h: ${vwap_1h}
+
+═══════════════════════════════════════════════════════════════
+
+CURRENT INDICATOR READINGS:
+"""
+
+    # Add detailed signal information - just the raw readings
+    for sig in signals:
+        llm_prompt += f"\n• {sig['name']}: {sig['reason']}"
+
+    llm_prompt += f"""
+
+═══════════════════════════════════════════════════════════════
+
+TASK FOR LLM:
+Based on the above market data, technical indicators, and signal alignment:
+
+1. What is your assessment of the current market bias (bullish/bearish/neutral)?
+2. What are the key support and resistance levels I should monitor?
+3. What is the optimal entry strategy given the current regime?
+4. What are the primary risks to this setup?
+5. What position size would you recommend given the current ATR and volatility?
+6. At what price levels would you exit for profit? For loss (stop)?
+7. What conditions would make you change your bias?
+
+Provide a concise, actionable trading recommendation.
+"""
+
+    # Display prompt with native Streamlit copy button
+    st.markdown("**📋 Copy and paste into your LLM (Claude, ChatGPT, etc.):**")
+    st.code(llm_prompt, language="text")
 
 def render_signal_detail_card(signal, d, h=1.0):
     """
@@ -3600,26 +4126,64 @@ def render_signal_detail_card(signal, d, h=1.0):
         verdict = "⚪ NEUTRAL"
         verdict_color = "#808080"
 
-    # Header with verdict badge and weight
+    # Header with weight (verdict badge removed per user feedback)
     st.markdown(f"""<div style='display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;'>
         <div style='font-size: 14px; font-weight: bold; color: #000;'>{sig_name} <span style='color: #0066CC; font-weight: normal;'>(Weight: {sig_weight})</span></div>
-        <div style='background: {verdict_color}; color: white; padding: 6px 12px; border-radius: 4px; font-size: 11px; font-weight: bold;'>{verdict}</div>
     </div>""", unsafe_allow_html=True)
+
+    # Brief chart descriptions
+    chart_descriptions = {
+        "DXY Dollar Trend": "Chart shows US Dollar Index (DXY) on 15m timeframe with MA20 trend line. Down = Bullish for silver.",
+        "ADX Trend Regime (15m, 1h, 4h)": "Chart shows ADX (trend strength) across 3 timeframes. Above 25 = Strong trending. Below 15 = Ranging.",
+        "Pivot Point Proximity": "Chart shows silver price with daily pivot levels (S2, S1, P, R1, R2) from yesterday's OHLC.",
+        "Oscillator Consensus (RSI + StochRSI + Williams%R)": "Chart shows RSI on 5m, 1h, and 4h with 30/70 overbought/oversold zones. Entry timing tool only.",
+        "MACD Trend (15m + 1h)": "Chart shows MACD (momentum) on 15m (entry timing) and 1h (confirmation). Green histogram = Up momentum.",
+        "OBV Accumulation (15m + 1h)": "Chart shows OBV (volume-weighted indicator) on 15m and 1h. Rising OBV with up price = Strong accumulation.",
+        "MFI Volume Flow (15m + 1h)": "Chart shows MFI (money flow) on 15m and 1h. Above 80 = Selling pressure. Below 20 = Buying pressure.",
+        "VWAP (15m + 1h)": "Chart shows VWAP (institutional fair value) on 15m and 1h. Price bounces off VWAP = Strong support/resistance.",
+        "Bollinger Bands + KC Squeeze (15m/1h)": "Chart shows Bollinger Bands (volatility extremes) and Keltner Channels on 5m price with 15m BB. Entry at band extremes.",
+        "Platinum Trend (1h)": "Chart shows platinum price and MA20 on 1h timeframe. Industrial demand co-movement with silver.",
+        "Inter-Market: Copper/Gold": "Chart shows copper/gold ratio on 1h. Rising = Risk-on (good for silver). Falling = Risk-off (headwind).",
+    }
+
+    if sig_name in chart_descriptions:
+        st.markdown(f"<div style='font-size: 10px; color: #666; margin-bottom: 12px; font-style: italic;'>{chart_descriptions[sig_name]}</div>", unsafe_allow_html=True)
 
     # Render chart based on signal type
     try:
-        # Create unique key for each chart based on signal name
-        chart_key = f"chart_{sig_name.replace(' ', '_').replace('(', '').replace(')', '')}"
+        # Create unique key for each chart based on signal name AND selected time range
+        # This ensures charts re-render when user changes the time range
+        selected_hours = st.session_state.get('selected_hours', 12)
+        chart_key = f"chart_{sig_name.replace(' ', '_').replace('(', '').replace(')', '')}_h{selected_hours}"
 
         if "Oscillator" in sig_name or "RSI" in sig_name:
             # RSI Triple: 5m, 1h, 4h RSI charts with 30/70 bounds
             fig = chart_rsi_triple(d, h=h)
             st.plotly_chart(fig, use_container_width=True, key=chart_key)
+
+            # If this is the full Oscillator Consensus signal, also show advanced oscillators
+            if "Oscillator Consensus" in sig_name:
+                st.markdown("<div style='margin-top: 16px;'></div>", unsafe_allow_html=True)
+                fig_advanced = chart_advanced_oscillators(d, h=h)
+                st.plotly_chart(fig_advanced, use_container_width=True, key=chart_key + "_advanced")
+
+                # Add interpretation guide
+                st.markdown("""
+                <div style='font-size: 10px; color: #666; background: #f5f5f5; padding: 8px; border-radius: 4px; margin-top: 8px;'>
+                <strong>Advanced Oscillators Guide:</strong><br>
+                • <strong>StochRSI</strong> (top-left): 0-20 = oversold (green zone), 80-100 = overbought (red zone)<br>
+                • <strong>Williams %R</strong> (top-middle): -20 to 0 = overbought (red zone), -100 to -80 = oversold (green zone)<br>
+                • <strong>MFI 15m/1h</strong> (top-right): 0-20 = oversold (green), 80-100 = overbought (red), uses volume weighting<br>
+                • <strong>Best consensus</strong>: Multiple oscillators in agreement (all in overbought OR all in oversold) strengthens signal<br>
+                • <strong>15m</strong> (top row) = entry-level precision, <strong>1h</strong> (bottom row) = trend confirmation
+                </div>
+                """, unsafe_allow_html=True)
         elif "MACD" in sig_name:
-            # MACD: 5m and 1h MACD with signal line and histogram (side by side for comparison)
-            # Show both timeframes for entry timing (5m) + confirmation (1h)
-            macd_5m = chart_macd_panel('macd_5m_hist', 'macd_5m_l', 'macd_5m_sig', "MACD 5m - Entry Timing", d, h=h)
-            st.plotly_chart(macd_5m, use_container_width=True, key=chart_key + "_5m")
+            # MACD: 15m and 1h MACD with signal line and histogram (side by side for comparison)
+            # Show both timeframes for entry timing (15m) + confirmation (1h)
+            # Excludes weekends, holidays, and any missing data
+            macd_15m = chart_macd_panel('macd_15m_hist', 'macd_15m_l', 'macd_15m_sig', "MACD 15m - Entry Timing", d, h=h)
+            st.plotly_chart(macd_15m, use_container_width=True, key=chart_key + "_15m")
 
             macd_1h = chart_macd_panel('macd_1h_hist', 'macd_1h_l', 'macd_1h_sig', "MACD 1h - Trend Confirmation", d, h=h)
             st.plotly_chart(macd_1h, use_container_width=True, key=chart_key + "_1h")
@@ -3628,29 +4192,62 @@ def render_signal_detail_card(signal, d, h=1.0):
             st.markdown("""
             <div style='font-size: 10px; color: #666; background: #f5f5f5; padding: 8px; border-radius: 4px; margin-top: 8px;'>
             <strong>How to read:</strong><br>
-            • <strong>5m chart</strong> (entry timing): Look for MACD crossing above signal = BUY, below = SELL<br>
-            • <strong>1h chart</strong> (confirmation): If MACD is above signal on 1h, 5m setup is stronger (trend aligned)<br>
+            • <strong>15m chart</strong> (entry timing): Look for MACD crossing above signal = BUY, below = SELL<br>
+            • <strong>1h chart</strong> (confirmation): If MACD is above signal on 1h, 15m setup is stronger (trend aligned)<br>
             • <strong>Histogram color</strong>: Green = momentum UP, Red = momentum DOWN<br>
-            • <strong>Best entries</strong>: When both 5m AND 1h MACD are above signal line
+            • <strong>Best entries</strong>: When both 15m AND 1h MACD are above signal line
             </div>
             """, unsafe_allow_html=True)
         elif "ADX" in sig_name or "DI" in sig_name:
-            # ADX: 1h ADX with +DI/-DI lines, bounds at 25 (trending) and 15 (developing)
-            fig = chart_adx_panel('adx_1h', 'di_plus_1h', 'di_minus_1h', "ADX + DI (1h)", d, h=h)
-            st.plotly_chart(fig, use_container_width=True, key=chart_key)
-        elif "Bollinger" in sig_name or "KC Squeeze" in sig_name:
-            # Bollinger Bands: 5m and 1h candlesticks with BB and KC (side by side for comparison)
-            # Show both timeframes for entry precision (5m) + confirmation (1h)
+            # ADX: Multi-timeframe view (15m, 1h, 4h) for granular trend analysis
+            # 15m - Entry timing (smoother than 5m, less noisy)
+            fig_15m = chart_adx_panel('adx_15m', 'di_plus_15m', 'di_minus_15m', "ADX + DI (15m) — Entry Timing", d, h=h)
+            st.plotly_chart(fig_15m, use_container_width=True, key=chart_key + "_15m")
 
-            # 5m chart - Entry precision
-            bb_5m = chart_candle(d['chart']['s5m'],
-                                d['chart']['bb_5m_up'], d['chart']['bb_5m_mid'], d['chart']['bb_5m_lo'],
-                                d['chart']['kc_5m_up'], d['chart']['kc_5m_lo'],
-                                d['chart']['vwap_5m'], "BB + KC 5m - Entry Precision", h=h)
-            st.plotly_chart(bb_5m, use_container_width=True, key=chart_key + "_5m")
+            # 1h - Confirmation (primary signal)
+            fig_1h = chart_adx_panel('adx_1h', 'di_plus_1h', 'di_minus_1h', "ADX + DI (1h) — Trend Confirmation", d, h=h)
+            st.plotly_chart(fig_1h, use_container_width=True, key=chart_key + "_1h")
+
+            # 4h - Higher timeframe context
+            fig_4h = chart_adx_panel('adx_4h', 'di_plus_4h', 'di_minus_4h', "ADX + DI (4h) — Higher Context", d, h=h)
+            st.plotly_chart(fig_4h, use_container_width=True, key=chart_key + "_4h")
+
+            # Add interpretation guide
+            st.markdown("""
+            <div style='font-size: 10px; color: #666; background: #f5f5f5; padding: 8px; border-radius: 4px; margin-top: 8px;'>
+            <strong>How to read ADX (Trend Strength):</strong><br>
+            • <strong>ADX < 15</strong> — RANGING: No clear trend, DI signals unreliable<br>
+            • <strong>ADX 15-25</strong> — DEVELOPING: Trend forming, use caution<br>
+            • <strong>ADX 25-50</strong> — TRENDING: Clear trend, DI signals reliable<br>
+            • <strong>ADX > 50</strong> — VERY STRONG: Extreme trend, risk of reversal<br>
+            • <strong>+DI above -DI</strong> — Bullish bias, uptrend likely<br>
+            • <strong>-DI above +DI</strong> — Bearish bias, downtrend likely<br>
+            • <strong>Best trades</strong>: High ADX (>25) + DI alignment with your bias (BULL = +DI above, BEAR = -DI above)
+            </div>
+            """, unsafe_allow_html=True)
+        elif "Bollinger" in sig_name or "KC Squeeze" in sig_name:
+            # Bollinger Bands: 15m and 1h candlesticks with BB and KC (side by side for comparison)
+            # Show both timeframes for entry precision (15m) + confirmation (1h)
+            # Excludes weekends, holidays, and any missing data
+
+            # 15m chart - Entry precision
+            if d['chart'].get('s15m') is not None and all([
+                d['chart'].get('bb_15m_up') is not None,
+                d['chart'].get('bb_15m_mid') is not None,
+                d['chart'].get('bb_15m_lo') is not None,
+                d['chart'].get('kc_15m_up') is not None,
+                d['chart'].get('kc_15m_lo') is not None
+            ]):
+                bb_15m = chart_candle(d['chart']['s15m'].dropna(),
+                                    d['chart']['bb_15m_up'], d['chart']['bb_15m_mid'], d['chart']['bb_15m_lo'],
+                                    d['chart']['kc_15m_up'], d['chart']['kc_15m_lo'],
+                                    None, "BB + KC 15m - Entry Precision", h=h)
+                st.plotly_chart(bb_15m, use_container_width=True, key=chart_key + "_15m")
+            else:
+                st.warning("⚠️ 15m Bollinger Bands data incomplete (waiting for more history)")
 
             # 1h chart - Confirmation
-            bb_1h = chart_candle(d['chart']['s1h'],
+            bb_1h = chart_candle(d['chart']['s1h'].dropna(),
                                 d['chart']['bb_1h_up'], d['chart']['bb_1h_mid'], d['chart']['bb_1h_lo'],
                                 d['chart']['kc_1h_up'], d['chart']['kc_1h_lo'],
                                 d['chart']['vwap_1h'], "BB + KC 1h - Trend Confirmation", h=h)
@@ -3660,20 +4257,20 @@ def render_signal_detail_card(signal, d, h=1.0):
             st.markdown("""
             <div style='font-size: 10px; color: #666; background: #f5f5f5; padding: 8px; border-radius: 4px; margin-top: 8px;'>
             <strong>How to read:</strong><br>
-            • <strong>5m chart</strong> (entry precision): Price touching lower BB = oversold entry zone, upper BB = overbought exit zone<br>
-            • <strong>1h chart</strong> (confirmation): If price is in lower BB zone on 1h too, 5m entry is stronger (confirmed oversold)<br>
+            • <strong>15m chart</strong> (entry precision): Price touching lower BB = oversold entry zone, upper BB = overbought exit zone<br>
+            • <strong>1h chart</strong> (confirmation): If price is in lower BB zone on 1h too, 15m entry is stronger (confirmed oversold)<br>
             • <strong>BB Squeeze</strong> (KC inside BB): Narrow bands = low volatility. Breakout likely when bands widen<br>
             • <strong>VWAP</strong> (dashed line): Institutional support/resistance. Price above = buying pressure, below = selling pressure<br>
-            • <strong>Best entries</strong>: When 5m price touches BB lower AND 1h price is in lower half of BB
+            • <strong>Best entries</strong>: When 15m price touches BB lower AND 1h price is in lower half of BB
             </div>
             """, unsafe_allow_html=True)
         elif "OBV" in sig_name:
-            # OBV: 5m and 1h On-Balance Volume with moving average (side by side)
-            # Show both timeframes for entry timing (5m) + confirmation (1h)
+            # OBV: 15m and 1h On-Balance Volume with moving average (side by side)
+            # Show both timeframes for entry timing (15m) + confirmation (1h)
 
-            # 5m OBV - Entry timing
-            obv_5m = chart_obv_panel('obv_5m', 'obv_5m_ma', "OBV 5m - Entry Timing", d, h=h)
-            st.plotly_chart(obv_5m, use_container_width=True, key=chart_key + "_5m")
+            # 15m OBV - Entry timing
+            obv_15m = chart_obv_panel('obv_15m', 'obv_15m_ma', "OBV 15m - Entry Timing", d, h=h)
+            st.plotly_chart(obv_15m, use_container_width=True, key=chart_key + "_15m")
 
             # 1h OBV - Confirmation
             obv_1h = chart_obv_panel('obv_1h', 'obv_1h_ma', "OBV 1h - Trend Confirmation", d, h=h)
@@ -3683,24 +4280,24 @@ def render_signal_detail_card(signal, d, h=1.0):
             st.markdown("""
             <div style='font-size: 10px; color: #666; background: #f5f5f5; padding: 8px; border-radius: 4px; margin-top: 8px;'>
             <strong>How to read:</strong><br>
-            • <strong>5m chart</strong> (entry timing): OBV above MA = accumulation (buying), below MA = distribution (selling)<br>
-            • <strong>1h chart</strong> (confirmation): If 1h OBV is also above MA, 5m entry is stronger (confirmed buying pressure)<br>
+            • <strong>15m chart</strong> (entry timing): OBV above MA = accumulation (buying), below MA = distribution (selling)<br>
+            • <strong>1h chart</strong> (confirmation): If 1h OBV is also above MA, 15m entry is stronger (confirmed buying pressure)<br>
             • <strong>Rising OBV</strong> = Volume supporting UP move (bullish), Falling OBV = Volume supporting DOWN move (bearish)<br>
-            • <strong>Best entries</strong>: When both 5m AND 1h OBV are above their moving averages
+            • <strong>Best entries</strong>: When both 15m AND 1h OBV are above their moving averages
             </div>
             """, unsafe_allow_html=True)
 
         elif "MFI" in sig_name:
-            # MFI: 5m and 1h Money Flow Index with volume analysis
-            # Show both timeframes for entry timing (5m) + confirmation (1h)
+            # MFI: 15m and 1h Money Flow Index with volume analysis
+            # Show both timeframes for entry timing (15m) + confirmation (1h)
 
-            # 5m MFI - Entry timing
-            mfi_5m = chart_advanced_oscillators(d, h=h)
-            st.plotly_chart(mfi_5m, use_container_width=True, key=chart_key + "_5m")
+            # 15m MFI - Entry timing
+            mfi_15m = chart_advanced_oscillators(d, h=h)
+            st.plotly_chart(mfi_15m, use_container_width=True, key=chart_key + "_15m")
 
             st.markdown("""
             <div style='font-size: 10px; color: #666; background: #f5f5f5; padding: 8px; border-radius: 4px; margin-top: 8px;'>
-            <strong>Advanced Oscillators Panel (5m + 1h):</strong><br>
+            <strong>Advanced Oscillators Panel (15m + 1h):</strong><br>
             • <strong>MFI (Money Flow Index)</strong>: Volume-weighted RSI. >80 = Overbought, <20 = Oversold<br>
             • <strong>StochRSI</strong>: Fast oscillator. Shows momentum divergence from price movement<br>
             • <strong>Williams %R</strong>: -80 to -20 = Oversold (buy), -20 to 0 = Overbought (sell)<br>
@@ -3710,15 +4307,28 @@ def render_signal_detail_card(signal, d, h=1.0):
             """, unsafe_allow_html=True)
         elif "DXY" in sig_name:
             # DXY: US Dollar Index - inverse correlation with silver
-            # Shows DXY trend vs 20-hour MA (above MA = dollar strength = silver headwind)
-            dxy_s = d['chart']['dxy1h']['Close'].dropna()
+            # Shows DXY trend vs 20-period MA on 15m (above MA = dollar strength = silver headwind)
+            # Excludes weekends, holidays, and any missing data
+            selected_hours = st.session_state.get('selected_hours', 12)
+            dxy_s = apply_time_filter(d['chart']['dxy15m']['Close'].dropna(), selected_hours)
+
+            # Use numeric x-axis to eliminate gaps
+            dxy_x = list(range(len(dxy_s)))
+            dxy_dates = [to_swedish_time(idx) for idx in dxy_s.index]
+
+            # Generate x-axis time labels
+            label_interval = max(1, len(dxy_s) // 6)
+            label_indices = [i for i in range(len(dxy_s)) if i % label_interval == 0]
+            label_times = [to_swedish_time(dxy_s.index[i]) for i in label_indices]
+
             fig = go.Figure()
             fig.add_hline(y=d['dxy_ma20'], line=dict(color="#FF9500", dash="dash", width=2),
-                         annotation_text=f"MA20h {d['dxy_ma20']:.2f}",
+                         annotation_text=f"MA20 (15m) {d['dxy_ma20']:.2f}",
                          annotation_position="right")
-            fig.add_trace(go.Scatter(x=dxy_s.index, y=dxy_s,
+            fig.add_trace(go.Scatter(x=dxy_x, y=dxy_s,
                                     line=dict(color="#0066CC", width=2),
-                                    name="DXY", fill='tozeroy', fillcolor="rgba(0,102,204,0.1)"))
+                                    name="DXY", fill='tozeroy', fillcolor="rgba(0,102,204,0.1)",
+                                    hovertext=dxy_dates, hovertemplate="<b>%{hovertext}</b><br>%{y:.2f}<extra></extra>"))
 
             # Auto-scale y-axis to data range with 5% padding
             dxy_min = dxy_s.min()
@@ -3729,115 +4339,239 @@ def render_signal_detail_card(signal, d, h=1.0):
             y_max = dxy_max + y_padding
 
             fig.update_layout(height=int(260 * h), plot_bgcolor=PLOT_BG, paper_bgcolor=PLOT_BG,
-                            title="US Dollar Index (1h) - Inverse Silver Correlation",
+                            title="US Dollar Index (15m)",
                             yaxis_title="DXY", xaxis_title="Time",
                             yaxis=dict(range=[y_min, y_max]),
+                            xaxis=dict(ticktext=label_times, tickvals=label_indices, gridcolor=GRID_COL),
                             margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified')
             fig.update_yaxes(gridcolor=GRID_COL)
             st.plotly_chart(fig, use_container_width=True, key=chart_key)
         elif "Platinum" in sig_name:
             # Platinum: Industrial demand indicator - shared with silver
             # Shows Platinum price vs 20-hour MA (above MA = risk-on = silver bullish)
-            pt_s = d['chart']['pt1h']['Close'].dropna()
+            # Excludes weekends, holidays, and any missing data
+            selected_hours = st.session_state.get('selected_hours', 12)
+            pt_s = apply_time_filter(d['chart']['pt1h']['Close'].dropna(), selected_hours)
+
+            # Use numeric x-axis to eliminate gaps
+            pt_x = list(range(len(pt_s)))
+            pt_dates = [to_swedish_time(idx) for idx in pt_s.index]
+
+            # Generate x-axis time labels
+            label_interval = max(1, len(pt_s) // 6)
+            label_indices = [i for i in range(len(pt_s)) if i % label_interval == 0]
+            label_times = [to_swedish_time(pt_s.index[i]) for i in label_indices]
+
+            # Calculate y-axis range based on data with padding
+            pt_min = pt_s.min()
+            pt_max = pt_s.max()
+            pt_range = pt_max - pt_min
+            y_padding = pt_range * 0.1  # 10% padding above and below
+            y_min = pt_min - y_padding
+            y_max = pt_max + y_padding
+
             fig = go.Figure()
             if d['pt_ma20']:
                 fig.add_hline(y=d['pt_ma20'], line=dict(color="#9933FF", dash="dash", width=2),
                              annotation_text=f"MA20h ${d['pt_ma20']:.0f}",
                              annotation_position="right")
-            fig.add_trace(go.Scatter(x=pt_s.index, y=pt_s,
+            fig.add_trace(go.Scatter(x=pt_x, y=pt_s,
                                     line=dict(color="#9933FF", width=2),
-                                    name="Platinum", fill='tozeroy', fillcolor="rgba(153,51,255,0.1)"))
+                                    name="Platinum", fill=None,
+                                    hovertext=pt_dates, hovertemplate="<b>%{hovertext}</b><br>$%{y:.0f}<extra></extra>"))
+
             fig.update_layout(height=int(260 * h), plot_bgcolor=PLOT_BG, paper_bgcolor=PLOT_BG,
-                            title="Platinum Price (1h) - Industrial Demand Indicator",
+                            title="Platinum Price (1h)",
                             yaxis_title="Price USD", xaxis_title="Time",
+                            xaxis=dict(ticktext=label_times, tickvals=label_indices, gridcolor=GRID_COL),
+                            yaxis=dict(range=[y_min, y_max]),
                             margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified')
             fig.update_yaxes(gridcolor=GRID_COL, tickformat="$.0f")
             st.plotly_chart(fig, use_container_width=True, key=chart_key)
         elif "Copper" in sig_name or "Inter-Market" in sig_name:
             # Copper/Gold Ratio: Risk-on indicator
-            # Rising ratio = industrial demand up = silver bullish
-            gs_s = d['chart']['gs_ratio'].dropna()
+            # Rising ratio = industrial demand up (copper up vs gold) = risk-on = silver bullish
+            # Excludes weekends, holidays, and any missing data
+            selected_hours = st.session_state.get('selected_hours', 12)
+
+            # Use Copper/Gold ratio if available, otherwise fall back to Gold/Silver
+            cu_ratio_data = d['chart'].get('cu_ratio')
+            if cu_ratio_data is not None and not cu_ratio_data.empty:
+                cu_s = apply_time_filter(cu_ratio_data.dropna(), selected_hours)
+                chart_label = "Copper/Gold Ratio"
+                chart_title = "Copper/Gold Ratio (1h)"
+                y_axis_title = "Cu/Au Ratio"
+            else:
+                cu_s = apply_time_filter(d['chart']['gs_ratio'].dropna(), selected_hours)
+                chart_label = "Gold/Silver Ratio"
+                chart_title = "Gold/Silver Ratio (1h)"
+                y_axis_title = "G/S Ratio"
+
+            # Use numeric x-axis to eliminate gaps
+            cu_x = list(range(len(cu_s)))
+            cu_dates = [to_swedish_time(idx) for idx in cu_s.index]
+
+            # Generate x-axis time labels
+            label_interval = max(1, len(cu_s) // 6)
+            label_indices = [i for i in range(len(cu_s)) if i % label_interval == 0]
+            label_times = [to_swedish_time(cu_s.index[i]) for i in label_indices]
+
+            # Calculate y-axis range based on data with padding
+            cu_min = cu_s.min()
+            cu_max = cu_s.max()
+            cu_range = cu_max - cu_min
+            y_padding = cu_range * 0.1  # 10% padding above and below
+            y_min = cu_min - y_padding
+            y_max = cu_max + y_padding
+
             fig = go.Figure()
-            fig.add_hline(y=80, line=dict(color=COL_BULL, dash="dot", width=1),
-                         annotation_text="80 — Silver cheap vs Gold")
-            fig.add_hline(y=60, line=dict(color=COL_BEAR, dash="dot", width=1),
-                         annotation_text="60 — Silver expensive vs Gold")
-            fig.add_trace(go.Scatter(x=gs_s.index, y=gs_s,
+            if chart_label == "Copper/Gold Ratio":
+                # Copper/Gold levels: Rising = risk-on (bullish for silver)
+                fig.add_hline(y=cu_s.mean() * 1.1, line=dict(color=COL_BULL, dash="dot", width=1),
+                             annotation_text="Risk-on (copper strong)")
+                fig.add_hline(y=cu_s.mean() * 0.9, line=dict(color=COL_BEAR, dash="dot", width=1),
+                             annotation_text="Risk-off (gold safe-haven)")
+            else:
+                # Gold/Silver levels
+                fig.add_hline(y=80, line=dict(color=COL_BULL, dash="dot", width=1),
+                             annotation_text="80 — Silver cheap vs Gold")
+                fig.add_hline(y=60, line=dict(color=COL_BEAR, dash="dot", width=1),
+                             annotation_text="60 — Silver expensive vs Gold")
+
+            fig.add_trace(go.Scatter(x=cu_x, y=cu_s,
                                     line=dict(color="#FF6600", width=2),
-                                    name="Gold/Silver Ratio", fill='tozeroy', fillcolor="rgba(255,102,0,0.1)"))
+                                    name=chart_label, fill=None,
+                                    hovertext=cu_dates, hovertemplate="<b>%{hovertext}</b><br>%{y:.1f}<extra></extra>"))
+
             fig.update_layout(height=int(260 * h), plot_bgcolor=PLOT_BG, paper_bgcolor=PLOT_BG,
-                            title="Gold/Silver Ratio (1h) - Relative Value Indicator",
-                            yaxis_title="G/S Ratio", xaxis_title="Time",
+                            title=chart_title,
+                            yaxis_title=y_axis_title, xaxis_title="Time",
+                            xaxis=dict(ticktext=label_times, tickvals=label_indices, gridcolor=GRID_COL),
+                            yaxis=dict(range=[y_min, y_max]),
                             margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified')
             fig.update_yaxes(gridcolor=GRID_COL, tickformat=".1f")
             st.plotly_chart(fig, use_container_width=True, key=chart_key)
         elif "VWAP" in sig_name:
             # VWAP: Volume-Weighted Average Price - institutional intraday benchmark
-            # Shows 5m and 1h candles with VWAP overlay for entry timing + trend confirmation
+            # Shows 15m and 1h candles with VWAP overlay for entry timing + trend confirmation
+            # Excludes weekends, holidays, and any missing data
+            selected_hours = st.session_state.get('selected_hours', 12)
 
-            # 5m VWAP - Entry Timing
-            s5m = d['chart']['s5m']
-            vwap_5m = d['chart']['vwap_5m'].dropna()
-            fig_5m = go.Figure()
-            fig_5m.add_trace(go.Candlestick(x=s5m.index, open=s5m['Open'], high=s5m['High'],
-                                           low=s5m['Low'], close=s5m['Close'],
-                                           increasing_line_color=COL_BULL,
-                                           decreasing_line_color=COL_BEAR,
-                                           name="Silver"))
-            fig_5m.add_trace(go.Scatter(x=vwap_5m.index, y=vwap_5m,
-                                       line=dict(color="#FF9500", width=2, dash="dash"),
-                                       name="VWAP", fill=None))
-            fig_5m.update_layout(height=int(260 * h), plot_bgcolor=PLOT_BG, paper_bgcolor=PLOT_BG,
-                                title="VWAP 5m - Entry Timing (Institutional Benchmark)",
-                                yaxis_title="Price USD", xaxis_title="Time",
-                                margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified')
-            fig_5m.update_yaxes(gridcolor=GRID_COL, tickformat="$.2f")
-            st.plotly_chart(fig_5m, use_container_width=True, key=chart_key + "_5m")
+            # 15m VWAP - Entry Timing
+            s15m = apply_time_filter(d['chart']['s15m'].dropna(), selected_hours)  # Remove any gaps/holidays and apply zoom filter
+            vwap_15m = apply_time_filter(d['chart']['vwap_15m'].dropna(), selected_hours)
+
+            # Use numeric x-axis to eliminate visual gaps
+            x_numeric_15m = list(range(len(s15m)))
+            x_dates_15m = [to_swedish_time(ts, '%Y-%m-%d %H:%M') for ts in s15m.index]
+
+            # Create custom tick positions: every N-th label to avoid crowding
+            tick_interval_15m = max(1, len(s15m) // 6)
+            tick_positions_15m = list(range(0, len(s15m), tick_interval_15m))
+            if len(s15m) - 1 not in tick_positions_15m:
+                tick_positions_15m.append(len(s15m) - 1)
+            tick_labels_15m = [x_dates_15m[i] if i < len(x_dates_15m) else "" for i in tick_positions_15m]
+
+            # Map VWAP data to numeric indices
+            vwap_15m_x_numeric = [i for i, d in enumerate(s15m.index) if d in vwap_15m.index]
+            vwap_15m_y = vwap_15m.values
+
+            fig_15m = go.Figure()
+            fig_15m.add_trace(go.Candlestick(x=x_numeric_15m, open=s15m['Open'], high=s15m['High'],
+                                            low=s15m['Low'], close=s15m['Close'],
+                                            increasing_line_color=COL_BULL,
+                                            decreasing_line_color=COL_BEAR,
+                                            name="Silver", hovertext=x_dates_15m,
+                                            hovertemplate="<b>%{hovertext}</b><br>O: %{open:.2f}<br>H: %{high:.2f}<br>L: %{low:.2f}<br>C: %{close:.2f}<extra></extra>"))
+            fig_15m.add_trace(go.Scatter(x=vwap_15m_x_numeric, y=vwap_15m_y,
+                                        line=dict(color="#FF9500", width=2, dash="dash"),
+                                        name="VWAP", fill=None, hovertemplate="<b>%{y:.2f}</b><extra></extra>"))
+            time_range = f"Last {selected_hours // 24} Days" if selected_hours >= 24 else f"Last {selected_hours} Hours"
+            fig_15m.update_layout(height=int(260 * h), plot_bgcolor=PLOT_BG, paper_bgcolor=PLOT_BG,
+                                 title="VWAP 15m - Entry Timing",
+                                 yaxis_title="Price USD", xaxis_title="Time",
+                                 margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified')
+            fig_15m.update_xaxes(tickvals=tick_positions_15m, ticktext=tick_labels_15m, gridcolor=GRID_COL)
+            fig_15m.update_yaxes(gridcolor=GRID_COL, tickformat="$.2f")
+            st.plotly_chart(fig_15m, use_container_width=True, key=chart_key + "_15m")
 
             # 1h VWAP - Trend Confirmation
-            s1h = d['chart']['s1h']
-            vwap_1h = d['chart']['vwap_1h'].dropna()
+            s1h = apply_time_filter(d['chart']['s1h'].dropna(), selected_hours)  # Remove any gaps/holidays and apply zoom filter
+            vwap_1h = apply_time_filter(d['chart']['vwap_1h'].dropna(), selected_hours)
+
+            # Use numeric x-axis to eliminate visual gaps
+            x_numeric = list(range(len(s1h)))
+            x_dates = [to_swedish_time(ts, '%Y-%m-%d %H:%M') for ts in s1h.index]
+
+            # Create custom tick positions: every N-th label to avoid crowding
+            tick_interval = max(1, len(s1h) // 6)
+            tick_positions = list(range(0, len(s1h), tick_interval))
+            if len(s1h) - 1 not in tick_positions:
+                tick_positions.append(len(s1h) - 1)
+            tick_labels = [x_dates[i] if i < len(x_dates) else "" for i in tick_positions]
+
+            # Map VWAP data to numeric indices
+            vwap_x_numeric = [i for i, d in enumerate(s1h.index) if d in vwap_1h.index]
+            vwap_y = vwap_1h.values
+
             fig_1h = go.Figure()
-            fig_1h.add_trace(go.Candlestick(x=s1h.index, open=s1h['Open'], high=s1h['High'],
+            fig_1h.add_trace(go.Candlestick(x=x_numeric, open=s1h['Open'], high=s1h['High'],
                                            low=s1h['Low'], close=s1h['Close'],
                                            increasing_line_color=COL_BULL,
                                            decreasing_line_color=COL_BEAR,
-                                           name="Silver"))
-            fig_1h.add_trace(go.Scatter(x=vwap_1h.index, y=vwap_1h,
+                                           name="Silver", hovertext=x_dates,
+                                           hovertemplate="<b>%{hovertext}</b><br>O: %{open:.2f}<br>H: %{high:.2f}<br>L: %{low:.2f}<br>C: %{close:.2f}<extra></extra>"))
+            fig_1h.add_trace(go.Scatter(x=vwap_x_numeric, y=vwap_y,
                                        line=dict(color="#FF9500", width=2, dash="dash"),
-                                       name="VWAP", fill=None))
+                                       name="VWAP", fill=None, hovertemplate="<b>%{y:.2f}</b><extra></extra>"))
             fig_1h.update_layout(height=int(260 * h), plot_bgcolor=PLOT_BG, paper_bgcolor=PLOT_BG,
-                                title="VWAP 1h - Trend Confirmation (Institutional Benchmark)",
+                                title="VWAP 1h - Trend Confirmation",
                                 yaxis_title="Price USD", xaxis_title="Time",
                                 margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified')
+            fig_1h.update_xaxes(tickvals=tick_positions, ticktext=tick_labels, gridcolor=GRID_COL)
             fig_1h.update_yaxes(gridcolor=GRID_COL, tickformat="$.2f")
             st.plotly_chart(fig_1h, use_container_width=True, key=chart_key + "_1h")
 
             st.markdown("""
             <div style='font-size: 10px; color: #666; background: #f5f5f5; padding: 8px; border-radius: 4px; margin-top: 8px;'>
-            <strong>VWAP Interpretation Guide (5m + 1h):</strong><br>
+            <strong>VWAP Interpretation Guide (15m + 1h):</strong><br>
             • <strong>VWAP Setup</strong>: Volume-Weighted Average Price resets daily at market open. Shows institutional accumulation zones<br>
             • <strong>Price Above VWAP</strong>: Buying pressure in control. Good entry for BUY BULL. Hold while above<br>
             • <strong>Price Below VWAP</strong>: Selling pressure in control. Good entry for BUY BEAR. Hold while below<br>
-            • <strong>5m Chart</strong>: Entry-level precision. Price must cross VWAP for entry confirmation<br>
-            • <strong>1h Chart</strong>: Trend confirmation. 1h VWAP shows broader institutional trend. 5m + 1h alignment = strongest signal<br>
-            • <strong>Best setup</strong>: Price breaks above VWAP on both 5m AND 1h = Strong institutional entry. Vice versa for bears<br>
-            • <strong>Divergence alert</strong>: 5m above but 1h below = Choppy market, wait for alignment before entering
+            • <strong>15m Chart</strong>: Entry-level precision. Price must cross VWAP for entry confirmation<br>
+            • <strong>1h Chart</strong>: Trend confirmation. 1h VWAP shows broader institutional trend. 15m + 1h alignment = strongest signal<br>
+            • <strong>Best setup</strong>: Price breaks above VWAP on both 15m AND 1h = Strong institutional entry. Vice versa for bears<br>
+            • <strong>Divergence alert</strong>: 15m above but 1h below = Choppy market, wait for alignment before entering
             </div>
             """, unsafe_allow_html=True)
         elif "Pivot" in sig_name:
             # Pivot Points: Daily S2, S1, Pivot, R1, R2 levels
             # Shows 1h candles with pivot level lines
-            s1h = d['chart']['s1h']
+            # Excludes weekends, holidays, and any missing data
+            selected_hours = st.session_state.get('selected_hours', 12)
+            s1h = apply_time_filter(d['chart']['s1h'].dropna(), selected_hours)  # Remove gaps/holidays and apply zoom filter
             pivots = d.get('pivots')
+
+            # Use numeric x-axis to eliminate visual gaps
+            x_numeric = list(range(len(s1h)))
+            x_dates = [to_swedish_time(ts, '%Y-%m-%d %H:%M') for ts in s1h.index]
+
+            # Create custom tick positions: every N-th label to avoid crowding
+            tick_interval = max(1, len(s1h) // 6)
+            tick_positions = list(range(0, len(s1h), tick_interval))
+            if len(s1h) - 1 not in tick_positions:
+                tick_positions.append(len(s1h) - 1)
+            tick_labels = [x_dates[i] if i < len(x_dates) else "" for i in tick_positions]
+
             fig = go.Figure()
-            fig.add_trace(go.Candlestick(x=s1h.index, open=s1h['Open'], high=s1h['High'],
+            fig.add_trace(go.Candlestick(x=x_numeric, open=s1h['Open'], high=s1h['High'],
                                         low=s1h['Low'], close=s1h['Close'],
                                         increasing_line_color=COL_BULL,
                                         decreasing_line_color=COL_BEAR,
-                                        name="Silver"))
+                                        name="Silver", hovertext=x_dates,
+                                        hovertemplate="<b>%{hovertext}</b><br>O: %{open:.2f}<br>H: %{high:.2f}<br>L: %{low:.2f}<br>C: %{close:.2f}<extra></extra>"))
 
-            # Add pivot level lines if available
+            # Add pivot level lines if available (only on data points, no gaps)
             if pivots is not None:
                 for key, color, label in [
                     ("R2", "rgba(255,50,50,0.8)", "R2 Resistance"),
@@ -3849,15 +4583,18 @@ def render_signal_detail_card(signal, d, h=1.0):
                     if key in pivots and not pivots[key].empty:
                         s = pivots[key].dropna()
                         if len(s) > 0:
-                            fig.add_trace(go.Scatter(x=s1h.index, y=[s.iloc[-1]]*len(s1h),
+                            # Only extend pivot line across actual data points (no gaps)
+                            fig.add_trace(go.Scatter(x=x_numeric, y=[s.iloc[-1]]*len(s1h),
                                                     mode='lines',
                                                     line=dict(color=color, width=1, dash="dash"),
-                                                    name=label))
+                                                    name=label, hovertemplate=label + ": " + f"{s.iloc[-1]:.2f}<extra></extra>"))
 
+            time_range = f"Last {selected_hours // 24} Days" if selected_hours >= 24 else f"Last {selected_hours} Hours"
             fig.update_layout(height=int(260 * h), plot_bgcolor=PLOT_BG, paper_bgcolor=PLOT_BG,
-                            title="Silver 1h with Daily Pivot Points (S2, S1, P, R1, R2)",
+                            title="Silver 1h with Daily Pivot Points",
                             yaxis_title="Price USD", xaxis_title="Time",
                             margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified')
+            fig.update_xaxes(tickvals=tick_positions, ticktext=tick_labels, gridcolor=GRID_COL)
             fig.update_yaxes(gridcolor=GRID_COL, tickformat="$.2f")
             st.plotly_chart(fig, use_container_width=True, key=chart_key)
     except Exception as e:
@@ -3866,46 +4603,88 @@ def render_signal_detail_card(signal, d, h=1.0):
     st.markdown("")  # Spacing
 
     # Current Status explanation
-    st.markdown(f"<div style='font-size: 11px; color: #666; font-weight: bold; text-transform: uppercase;'>Current Status</div>", unsafe_allow_html=True)
-    st.markdown(f"<div style='font-size: 11px; color: #000; line-height: 1.5;'>{sig_reason}</div>", unsafe_allow_html=True)
-
-    st.markdown("")  # Spacing
+    st.markdown(f"""
+    <div style='background: #F0F7FF; border-left: 4px solid #0066CC; border-radius: 6px; padding: 12px; margin-bottom: 12px;'>
+        <div style='font-size: 10px; color: #0066CC; font-weight: bold; text-transform: uppercase; margin-bottom: 6px;'>📊 Current Status</div>
+        <div style='font-size: 12px; color: #000; line-height: 1.7; font-family: monospace;'>{sig_reason}</div>
+    </div>
+    """, unsafe_allow_html=True)
 
     # What This Means explanation
-    st.markdown(f"<div style='font-size: 11px; color: #666; font-weight: bold; text-transform: uppercase;'>What This Means</div>", unsafe_allow_html=True)
-    st.markdown(f"<div style='font-size: 11px; color: #555; line-height: 1.5;'>{sig_detail}</div>", unsafe_allow_html=True)
+    st.markdown(f"""
+    <div style='background: #FFF8F0; border-left: 4px solid #FF9500; border-radius: 6px; padding: 12px; margin-bottom: 12px;'>
+        <div style='font-size: 10px; color: #FF6600; font-weight: bold; text-transform: uppercase; margin-bottom: 6px;'>ℹ️ What This Signal Means</div>
+        <div style='font-size: 12px; color: #333; line-height: 1.8;'>{sig_detail}</div>
+    </div>
+    """, unsafe_allow_html=True)
 
     st.markdown("---")  # Separator between cards
 
 # ═══════════════════════════════════════════════════════════════════
-# SIDEBAR
+# SIDEBAR - NAVIGATION
 # ═══════════════════════════════════════════════════════════════════
 
-st.sidebar.markdown(f"""
-<div style='background:{BG_CARD};border-radius:6px;padding:10px;
-            border:2px solid {TEXT_SECONDARY};margin-bottom:12px;'>
-    <div style='font-size:12px;font-weight:900;color:{TEXT_PRIMARY};letter-spacing:0.5px;'>
-        CONTROL PANEL
-    </div>
-</div>
-""", unsafe_allow_html=True)
-st.sidebar.info("📊 Manual refresh only — Press button to get latest data")
-if st.sidebar.button("🔄 Refresh Now (Get Fresh Data)", use_container_width=True):
+st.sidebar.markdown("### 📍 Signals")
+st.sidebar.markdown("""
+- [🔷 DXY Trend](#dxy-dollar-trend)
+- [📈 ADX Regime](#adx-trend-regime-15m-1h-4h)
+- [🎯 Pivot Points](#pivot-point-proximity)
+- [📊 Oscillator](#oscillator-consensus-rsi-stochrsi-williamsr)
+- [📉 MACD](#macd-trend-15m-1h)
+- [📦 OBV](#obv-accumulation-15m-1h)
+- [💰 MFI](#mfi-volume-flow-15m-1h)
+- [📍 VWAP](#vwap-15m-1h)
+- [🎪 BB+KC](#bollinger-bands-kc-squeeze-15m1h)
+- [🥈 Platinum](#platinum-trend-1h)
+- [📊 Cu/Au](#inter-market-coppergold)
+""")
+
+st.sidebar.markdown("---")
+
+# Time range selector
+st.sidebar.markdown("### ⏱️ View")
+if st.sidebar.button("🔄 Refresh", use_container_width=True):
     st.cache_data.clear()
     st.rerun()
 
-st.sidebar.markdown(f"""
-<div style='font-size:11px;font-weight:900;color:{TEXT_PRIMARY};letter-spacing:0.5px;
-            margin-top:12px;margin-bottom:6px;text-transform:uppercase;border-top:1px solid rgba(255,255,255,0.15);padding-top:12px;'>
-Display Settings
-</div>
-""", unsafe_allow_html=True)
-chart_scale = st.sidebar.select_slider(
-    "Chart Height",
-    options=["Compact", "Normal", "Large"],
-    value="Normal"
+# Initialize session state for time range
+if 'selected_hours' not in st.session_state:
+    st.session_state.selected_hours = 12  # Default to 12 hours
+
+# Time range options
+time_options = [6, 12, 18, 24, 48, 72]
+time_labels = ["6h", "12h", "18h", "24h", "2d", "3d"]
+
+# Radio buttons for time range control
+st.sidebar.markdown("### ⏱️ Time Range")
+selected_label = st.sidebar.radio(
+    "Select history duration:",
+    options=time_labels,
+    index=time_labels.index("12h") if "12h" in time_labels else 1,
+    label_visibility="collapsed"
 )
-H = {"Compact": 0.7, "Normal": 1.4, "Large": 2.1}[chart_scale]
+
+# Map label to hours
+selected_index = time_labels.index(selected_label)
+st.session_state.selected_hours = time_options[selected_index]
+
+# Convert hours to readable format
+hours = st.session_state.selected_hours
+if hours >= 24:
+    days = hours / 24
+    if days == int(days):
+        time_label = f"Last {int(days)} Days"
+    else:
+        time_label = f"Last {days:.1f} Days"
+else:
+    time_label = f"Last {hours} Hours"
+
+# Display current selection with color coding
+view_color = "#FF9500"
+st.sidebar.markdown(f"<div style='font-size:11px;color:{view_color};text-align:center;margin-top:8px;font-weight:bold;'>📊 {time_label}</div>", unsafe_allow_html=True)
+
+# Fixed chart height
+H = 1.4
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -3918,13 +4697,6 @@ st.markdown(f"""
             border:2px solid rgba(0,0,0,0.15);'>
     <div style='font-size:36px;font-weight:900;color:{TEXT_PRIMARY};margin-bottom:8px;letter-spacing:1px;'>
         SILVER MARKET ANALYSIS
-    </div>
-    <div style='font-size:12px;color:{TEXT_SECONDARY};line-height:1.5;'>
-        Professional analyst dashboard + Educational platform for intraday trading
-        <br>
-        <span style='color:{COL_BULL};font-weight:bold;'>●</span> Multi-timeframe analysis (5m / 1h / 4h)
-        <span style='color:{TEXT_SECONDARY};margin-left:14px;'>●</span> Regime-adaptive signal weighting
-        <span style='color:{TEXT_SECONDARY};margin-left:14px;'>●</span> Real-time volatility-scaled predictions
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -3965,25 +4737,14 @@ with st.expander("📖 How to Use This Dashboard (Start Here)", expanded=False):
 
     ---
 
-    ### 💰 **PHASE 3: ENTRY PRECISION** — Exactly When & Where Do I Enter?
-
-    Once you decide to trade, find your exact entry and exit zones:
-    - **Entry Options by Timeframe** — Choose your trading style (Fast Scalp vs Multi-Timeframe)
-    - **Entry/Exit Range Analysis** — Shows exact Bollinger Band zones for entry/exit
-    - **Bollinger Bands + RSI** (Weight: 1.5 + 1.0) — Entry timing and price extremes
-
-    **Learn**: Entries at extremes (lower BB for bulls, upper BB for bears) have higher odds.
-
-    ---
-
-    ### 📚 **PHASE 4: SUPPORTING CONTEXT** — Additional Reference (Collapsed)
+    ### 📚 **PHASE 3: SUPPORTING CONTEXT** — Additional Reference (Collapsed)
 
     **Optional deep dive** for additional context:
     - **Platinum & Copper/Gold Trends** (Weight: 1.0) — How related markets look
     - **Signal History** — How the signal has evolved over last 45 minutes
     - **Market Data** — Current prices, spread status, regime
 
-    **Learn**: Supporting signals are lower priority. Trust Phase 1-3 first.
+    **Learn**: Supporting signals are lower priority. Trust Phase 1-2 first.
 
     ---
 
@@ -4008,14 +4769,12 @@ with st.expander("📖 How to Use This Dashboard (Start Here)", expanded=False):
 
     **For Quick Decisions (2 minutes):**
     1. Check Phase 1 — Is setup in place?
-    2. Check trading signal — What's the verdict?
-    3. Go to Phase 3 — Where exactly do I enter?
+    2. Check Phase 2 trading signal — What's the verdict?
 
     **For Deep Analysis (5 minutes):**
     1. Read all Phase 1 signals with charts
     2. Verify Phase 2 momentum confirms
-    3. Plan entry/exit using Phase 3 zones
-    4. Expand Phase 4 for macro context
+    3. Expand Phase 3 for macro context
 
     **For Learning:**
     - Each signal card explains:
@@ -4028,7 +4787,6 @@ with st.expander("📖 How to Use This Dashboard (Start Here)", expanded=False):
     ## Pro Tips
 
     ✅ **DO**: Trade only when Phase 1 + Phase 2 align
-    ✅ **DO**: Use Phase 3 zones for precise entry/exit
     ✅ **DO**: Check signal weight — higher weights = more important
     ❌ **DON'T**: Trade oscillators alone (they're weight 1.0 for a reason)
     ❌ **DON'T**: Ignore DXY — commodities are dollar-driven
@@ -4064,7 +4822,10 @@ initialize_signal_history()
 
 # Status bar with data freshness
 age    = data_age_hours(d['last_ts'])
-ts_str = d['last_ts'].strftime('%Y-%m-%d %H:%M UTC')
+# Convert UTC to Swedish time (Europe/Stockholm)
+swedish_tz = pytz.timezone('Europe/Stockholm')
+ts_swedish = d['last_ts'].astimezone(swedish_tz) if d['last_ts'].tzinfo else pytz.utc.localize(d['last_ts']).astimezone(swedish_tz)
+ts_str = ts_swedish.strftime('%Y-%m-%d %H:%M %Z')
 
 if age > 1:
     status_color = COL_BEAR
@@ -4126,45 +4887,158 @@ atr_val = d.get('atr_5m') or 0
 regime_val = d.get('regime') or 'UNKNOWN'
 st.markdown(f"### ${silver_price:.2f} | {regime_val} Market | ATR: {atr_val:.2f}")
 
-# Main signal box (simplified)
-if cert_signal == 'BUY_BULL':
-    sig_color, sig_text = COL_BULL, "🟢 BUY BULL"
-elif cert_signal == 'BUY_BEAR':
-    sig_color, sig_text = COL_BEAR, "🔴 BUY BEAR"
-else:
-    sig_color, sig_text = COL_NEUT, "⚪ WAIT"
+# ═══════════════════════════════════════════════════════════════════
+# LAST 1 HOUR PRICE ACTION (GRANULAR VIEW)
+# ═══════════════════════════════════════════════════════════════════
 
-if cert_signal == 'WAIT' or cert_entry is None or cert_target is None or cert_stop is None:
-    # WAIT signal or insufficient data - show no prices
-    st.markdown(f"""
-<div style='background:#fff;border:3px solid {sig_color};border-radius:8px;padding:16px;margin-bottom:16px;'>
-    <div style='font-size:28px;font-weight:bold;color:{sig_color};margin-bottom:8px;'>{sig_text}</div>
-    <div style='font-size:14px;color:{TEXT_PRIMARY};margin-bottom:8px;'>Confidence: <strong>{cert_conf}%</strong></div>
-    <div style='margin-top:12px;padding-top:12px;border-top:1px solid #eee;font-size:11px;color:{TEXT_SECONDARY};line-height:1.7;'>
-        {'<br>'.join(cert_reasoning[:3]) if cert_reasoning else 'Waiting for clearer signal...'}
-    </div>
-</div>
-""", unsafe_allow_html=True)
-else:
-    # BUY signal - show entry/target/stop
-    entry_val = cert_entry if cert_entry is not None else d.get('silver', 0)
-    target_val = cert_target if cert_target is not None else d.get('silver', 0)
-    stop_val = cert_stop if cert_stop is not None else d.get('silver', 0)
+hours = st.session_state.get("selected_hours", 12)
+view_title = "LAST PRICE ACTION"
+st.markdown(f"<div style='font-size:12px;font-weight:bold;color:{TEXT_PRIMARY};margin-bottom:12px;'>{view_title} (5m Candles + 15m Bollinger Bands)</div>", unsafe_allow_html=True)
 
-    st.markdown(f"""
-<div style='background:#fff;border:3px solid {sig_color};border-radius:8px;padding:16px;margin-bottom:16px;'>
-    <div style='font-size:28px;font-weight:bold;color:{sig_color};margin-bottom:8px;'>{sig_text}</div>
-    <div style='font-size:14px;color:{TEXT_PRIMARY};margin-bottom:8px;'>Confidence: <strong>{cert_conf}%</strong></div>
-    <div style='font-size:12px;color:{TEXT_PRIMARY};line-height:1.6;'>
-        Entry: <strong>${entry_val:.3f}</strong> | Target: <strong>${target_val:.3f}</strong> | Stop: <strong>${stop_val:.3f}</strong>
-    </div>
-    <div style='margin-top:12px;padding-top:12px;border-top:1px solid #eee;font-size:11px;color:{TEXT_SECONDARY};line-height:1.7;'>
-        {'<br>'.join(cert_reasoning[:3]) if cert_reasoning else 'Signal generated'}
-    </div>
-</div>
-""", unsafe_allow_html=True)
+# Get 5-minute candles based on selected hours
+# Only include candles with complete data (no gaps/holidays)
+selected_hours = st.session_state.get('selected_hours', 12)
+candle_count = selected_hours * 12  # 12 candles per hour for 5m data
+s5m = d.get('chart', {}).get('s5m', None)
+if s5m is not None and len(s5m) >= candle_count:
+    s5m_last_1h = s5m.iloc[-candle_count:].copy()
+    # Remove any rows with missing data (gaps, holidays)
+    s5m_last_1h = s5m_last_1h.dropna()
+    bb_up_15m = d.get('chart', {}).get('bb_15m_up', None)
+    bb_mid_15m = d.get('chart', {}).get('bb_15m_mid', None)
+    bb_lo_15m = d.get('chart', {}).get('bb_15m_lo', None)
 
-st.markdown("")  # Spacing
+    if bb_up_15m is not None and bb_mid_15m is not None and bb_lo_15m is not None:
+        # Reindex 15m BB to match 5m candle timestamps (forward fill to handle timestamp misalignment)
+        bb_up_filt = bb_up_15m.reindex(s5m_last_1h.index, method='ffill').dropna() if isinstance(bb_up_15m, pd.Series) else None
+        bb_mid_filt = bb_mid_15m.reindex(s5m_last_1h.index, method='ffill').dropna() if isinstance(bb_mid_15m, pd.Series) else None
+        bb_lo_filt = bb_lo_15m.reindex(s5m_last_1h.index, method='ffill').dropna() if isinstance(bb_lo_15m, pd.Series) else None
+
+        # Create candlestick chart with numeric x-axis to eliminate gaps
+        x_numeric = list(range(len(s5m_last_1h)))
+        x_dates = [to_swedish_time(ts) for ts in s5m_last_1h.index]
+
+        # Create custom tick positions
+        tick_interval = max(1, len(s5m_last_1h) // 4)
+        tick_positions = list(range(0, len(s5m_last_1h), tick_interval))
+        if len(s5m_last_1h) - 1 not in tick_positions:
+            tick_positions.append(len(s5m_last_1h) - 1)
+        tick_labels = [x_dates[i] if i < len(x_dates) else "" for i in tick_positions]
+
+        fig = go.Figure()
+
+        # Candlesticks
+        fig.add_trace(go.Candlestick(
+            x=x_numeric,
+            open=s5m_last_1h['Open'],
+            high=s5m_last_1h['High'],
+            low=s5m_last_1h['Low'],
+            close=s5m_last_1h['Close'],
+            increasing_line_color=COL_BULL,
+            decreasing_line_color=COL_BEAR,
+            name="Silver Price",
+            hovertext=x_dates,
+            hovertemplate="<b>%{hovertext}</b><br>O: $%{open:.3f}<br>H: $%{high:.3f}<br>L: $%{low:.3f}<br>C: $%{close:.3f}"
+        ))
+
+        # Bollinger Bands
+        if bb_up_filt is not None and len(bb_up_filt) > 0:
+            bb_up_x = [i for i, d in enumerate(s5m_last_1h.index) if d in bb_up_filt.index]
+            fig.add_trace(go.Scatter(
+                x=bb_up_x, y=bb_up_filt.values,
+                mode='lines', name='Upper BB',
+                line=dict(color=COL_BEAR, width=1, dash='dash'),
+                hovertemplate="<b>Upper BB</b><br>%{y:.3f}"
+            ))
+
+        if bb_mid_filt is not None and len(bb_mid_filt) > 0:
+            bb_mid_x = [i for i, d in enumerate(s5m_last_1h.index) if d in bb_mid_filt.index]
+            fig.add_trace(go.Scatter(
+                x=bb_mid_x, y=bb_mid_filt.values,
+                mode='lines', name='Middle BB',
+                line=dict(color=TEXT_SECONDARY, width=1, dash='dash'),
+                hovertemplate="<b>Mid BB</b><br>%{y:.3f}"
+            ))
+
+        if bb_lo_filt is not None and len(bb_lo_filt) > 0:
+            bb_lo_x = [i for i, d in enumerate(s5m_last_1h.index) if d in bb_lo_filt.index]
+            fig.add_trace(go.Scatter(
+                x=bb_lo_x, y=bb_lo_filt.values,
+                mode='lines', name='Lower BB',
+                line=dict(color=COL_BULL, width=1, dash='dash'),
+                hovertemplate="<b>Lower BB</b><br>%{y:.3f}"
+            ))
+
+        # Add Daily Pivot Points
+        pivots = d.get('pivots', {})
+        if pivots:
+            pivot_colors = {
+                'R2': '#8B0000',  # Dark red
+                'R1': '#FF6B6B',  # Light red
+                'P': '#4169E1',   # Royal blue (pivot)
+                'S1': '#90EE90',  # Light green
+                'S2': '#006400'   # Dark green
+            }
+            pivot_labels = {
+                'R2': 'R2 (Daily Resistance 2)',
+                'R1': 'R1 (Daily Resistance 1)',
+                'P': 'Daily Pivot',
+                'S1': 'S1 (Daily Support 1)',
+                'S2': 'S2 (Daily Support 2)'
+            }
+
+            for level in ['R2', 'R1', 'P', 'S1', 'S2']:
+                if level in pivots and pivots[level] is not None:
+                    pivot_value = pivots[level].iloc[-1] if hasattr(pivots[level], 'iloc') else pivots[level]
+                    fig.add_hline(
+                        y=pivot_value,
+                        line=dict(color=pivot_colors[level], width=1, dash='dot'),
+                        annotation_text=pivot_labels[level],
+                        annotation_position="right",
+                        annotation_font=dict(size=9, color=pivot_colors[level])
+                    )
+
+        # Current price line
+        current_price_val = d.get('silver') or 0
+        fig.add_hline(
+            y=current_price_val,
+            line=dict(color="#FF9500", width=2, dash="solid"),
+            annotation_text=f"Current: ${current_price_val:.3f}",
+            annotation_position="right"
+        )
+
+        fig.update_layout(
+            title="LAST PRICE ACTION (5m Candles + 15m Bollinger Bands)",
+            yaxis_title="Price (USD)",
+            xaxis_title="Time",
+            template='plotly_white',
+            height=int(380 * H),
+            hovermode='x unified',
+            yaxis=dict(tickformat="$.3f"),
+            margin=dict(l=60, r=40, t=40, b=40),
+            plot_bgcolor=PLOT_BG,
+            paper_bgcolor=PLOT_BG
+        )
+
+        fig.update_xaxes(tickvals=tick_positions, ticktext=tick_labels, gridcolor=GRID_COL)
+        fig.update_yaxes(gridcolor=GRID_COL)
+        st.plotly_chart(fig, use_container_width=True, key="1h_price_action")
+
+        # Quick interpretation
+        last_close = s5m_last_1h['Close'].iloc[-1]
+        price_at_upper = last_close > (bb_up_filt.iloc[-1] if bb_up_filt is not None and len(bb_up_filt) > 0 else 0)
+        price_at_lower = last_close < (bb_lo_filt.iloc[-1] if bb_lo_filt is not None and len(bb_lo_filt) > 0 else 0)
+
+        if price_at_upper:
+            zone_status = "⚠️ Price at UPPER BB - Overbought, consider exit for bulls / entry for bears"
+        elif price_at_lower:
+            zone_status = "✅ Price at LOWER BB - Oversold, consider entry for bulls / exit for bears"
+        else:
+            zone_status = "⏸️ Price in MIDDLE zone - Neutral, wait for breakout"
+
+        st.caption(zone_status)
+
+st.markdown("")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PROFESSIONAL ANALYST DECISION FLOW
@@ -4181,10 +5055,17 @@ Macro tailwind? Trend established? Momentum confirmed?
 </div>
 """, unsafe_allow_html=True)
 
-# Render Phase 1 signals: DXY, ADX, Pivot Points
-phase_1_signals = ["DXY Dollar Trend", "ADX Trend Regime (1h)", "Pivot Point Proximity"]
+# Render Phase 1 signals: DXY, ADX, Pivot Points, Oscillators
+phase_1_signals = ["DXY Dollar Trend", "ADX Trend Regime (15m, 1h, 4h)", "Pivot Point Proximity", "Oscillator Consensus (RSI + StochRSI + Williams%R)"]
 for sig in signals:
     if sig['name'] in phase_1_signals:
+        # Add anchor for navigation
+        anchor_id = sig['name'].lower().replace(" ", "-").replace("(", "").replace(")", "").replace("+", "-").replace("/", "").replace(",", "").replace(":", "").replace("%", "")
+        # Collapse consecutive dashes into single dashes
+        while "--" in anchor_id:
+            anchor_id = anchor_id.replace("--", "-")
+        # Use a span with both id and name attributes, with a zero-width space to ensure it renders
+        st.markdown(f'<span id="{anchor_id}" name="{anchor_id}" style="display:block; height:0; margin:0; padding:0;">‌</span>', unsafe_allow_html=True)
         render_signal_detail_card(sig, d, h=H)
 
 st.markdown("")  # Spacing
@@ -4207,307 +5088,20 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-phase_2_signals = ["MACD Trend (5m + 1h)", "OBV Accumulation (5m + 1h)", "MFI Volume Flow (5m + 1h)", "VWAP (5m + 1h)"]
+phase_2_signals = ["MACD Trend (15m + 1h)", "OBV Accumulation (15m + 1h)", "MFI Volume Flow (15m + 1h)", "VWAP (15m + 1h)"]
 for sig in signals:
     if sig['name'] in phase_2_signals:
+        # Add anchor for navigation
+        anchor_id = sig['name'].lower().replace(" ", "-").replace("(", "").replace(")", "").replace("+", "-").replace("/", "").replace(",", "").replace(":", "").replace("%", "")
+        # Collapse consecutive dashes into single dashes
+        while "--" in anchor_id:
+            anchor_id = anchor_id.replace("--", "-")
+        # Use a span with both id and name attributes, with a zero-width space to ensure it renders
+        st.markdown(f'<span id="{anchor_id}" name="{anchor_id}" style="display:block; height:0; margin:0; padding:0;">‌</span>', unsafe_allow_html=True)
         render_signal_detail_card(sig, d, h=H)
 
 st.markdown("")  # Spacing
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# PHASE 3: ENTRY PRECISION — "Exactly When & Where Do I Enter?"
-st.markdown("---")
-st.markdown(f"""
-<div style='font-size:16px;font-weight:900;color:{TEXT_PRIMARY};letter-spacing:1px;margin-bottom:4px;'>
-💰 PHASE 3: ENTRY PRECISION
-</div>
-<div style='font-size:11px;color:{TEXT_SECONDARY};margin-bottom:16px;'>
-Now that setup is confirmed, find your exact entry and exit zones
-</div>
-""", unsafe_allow_html=True)
-
-# Entry options by timeframe (show only the timeframes being predicted)
-st.markdown("#### Entry Options by Timeframe")
-
-# Prediction timeframe mode selector
-timeframe_mode = st.radio(
-    "Choose your trading style:",
-    options=["Fast Scalp (1h→15m→5m)", "Multi-Timeframe (4h→1h→15m)"],
-    index=1,
-    horizontal=True,
-    help="Fast Scalp: Quick 5m-15m entries with 1h confirmation. Multi-Timeframe: Strategic entries from 4h macro view"
-)
-
-# Compute predictions based on selected timeframe mode
-predictions = {}
-if timeframe_mode == "Fast Scalp (1h→15m→5m)":
-    timeframes_to_predict = [60, 15, 10, 5]  # 1h, 15m, 10m, 5m
-    mode_label = "⚡ Fast Scalp Mode (Intraday)"
-    display_timeframes = [60, 15, 5]  # 1h, 15m, 5m
-else:  # Multi-Timeframe (4h→1h→15m)
-    timeframes_to_predict = [240, 60, 15, 10]  # 4h, 1h, 15m, 10m
-    mode_label = "📊 Multi-Timeframe Mode (Macro + Entry)"
-    display_timeframes = [240, 60, 15]  # 4h, 1h, 15m
-
-for tf in timeframes_to_predict:
-    predictions[tf] = predict_move(d, tf, signals=signals)
-
-st.caption(f"Mode: {mode_label}")
-
-cols = st.columns(3)
-for i, tf in enumerate(display_timeframes):
-    pred = predictions.get(tf, {})
-    direction = pred.get('direction', 'UNKNOWN')
-    confidence = pred.get('confidence', 0)
-
-    dir_icon = "📈" if direction == "UP" else ("📉" if direction == "DOWN" else "⏸️")
-    dir_text = "UP" if direction == "UP" else ("DOWN" if direction == "DOWN" else "FLAT")
-
-    with cols[i]:
-        tf_label = "5m" if tf == 5 else ("15m" if tf == 15 else ("1h" if tf == 60 else "4h"))
-        st.write(f"**{tf_label}**: {dir_icon} {dir_text} ({confidence}%)")
-        if 'target_price' in pred and 'stop_loss' in pred:
-            st.caption(f"T: ${pred['target_price']:.3f} | S: ${pred['stop_loss']:.3f}")
-
-st.markdown("")  # Spacing
-
-# TECHNICAL ANALYSIS - Entry/Exit Range as dedicated cards
-st.markdown("---")
-st.markdown("## 📈 Entry/Exit Range Analysis")
-
-# Toggle between BULL and BEAR analysis view
-analysis_type = st.radio(
-    "Analyze for:",
-    ["🟢 BUY BULL (Price UP)", "🔴 BUY BEAR (Price DOWN)"],
-    horizontal=True,
-    help="Choose to see entry/exit analysis for BULL or BEAR positions"
-)
-
-is_bull_analysis = "BULL" in analysis_type
-
-if is_bull_analysis:
-    st.markdown("**Entry Strategy: Buy when price reaches LOWER Bollinger Band | Exit Strategy: Sell when price reaches UPPER Bollinger Band**")
-else:
-    st.markdown("**Entry Strategy: Short when price reaches UPPER Bollinger Band | Exit Strategy: Cover when price reaches LOWER Bollinger Band**")
-
-st.markdown("")
-
-# ═══════════════════════════════════════════════════════════════════
-# LAST 1 HOUR PRICE ACTION (GRANULAR VIEW)
-# ═══════════════════════════════════════════════════════════════════
-
-st.markdown(f"<div style='font-size:12px;font-weight:bold;color:{TEXT_PRIMARY};margin-bottom:12px;'>LAST 1 HOUR PRICE ACTION (5m Candles + Bollinger Bands)</div>", unsafe_allow_html=True)
-
-# Get last 12 5-minute candles (approximately 1 hour)
-s5m = d.get('chart', {}).get('s5m', None)
-if s5m is not None and len(s5m) >= 12:
-    s5m_last_1h = s5m.iloc[-12:].copy()
-    bb_up_5m = d.get('chart', {}).get('bb_5m_up', None)
-    bb_mid_5m = d.get('chart', {}).get('bb_5m_mid', None)
-    bb_lo_5m = d.get('chart', {}).get('bb_5m_lo', None)
-
-    if bb_up_5m is not None and bb_mid_5m is not None and bb_lo_5m is not None:
-        # Filter bands for the same time range
-        bb_up_filt = bb_up_5m.loc[s5m_last_1h.index].dropna() if isinstance(bb_up_5m, pd.Series) else None
-        bb_mid_filt = bb_mid_5m.loc[s5m_last_1h.index].dropna() if isinstance(bb_mid_5m, pd.Series) else None
-        bb_lo_filt = bb_lo_5m.loc[s5m_last_1h.index].dropna() if isinstance(bb_lo_5m, pd.Series) else None
-
-        # Create candlestick chart
-        fig = go.Figure()
-
-        # Candlesticks
-        fig.add_trace(go.Candlestick(
-            x=s5m_last_1h.index,
-            open=s5m_last_1h['Open'],
-            high=s5m_last_1h['High'],
-            low=s5m_last_1h['Low'],
-            close=s5m_last_1h['Close'],
-            increasing_line_color=COL_BULL,
-            decreasing_line_color=COL_BEAR,
-            name="Silver Price",
-            hovertemplate="<b>%{x|%H:%M}</b><br>O: $%{open:.3f}<br>H: $%{high:.3f}<br>L: $%{low:.3f}<br>C: $%{close:.3f}"
-        ))
-
-        # Bollinger Bands
-        if bb_up_filt is not None and len(bb_up_filt) > 0:
-            fig.add_trace(go.Scatter(
-                x=bb_up_filt.index, y=bb_up_filt,
-                mode='lines', name='Upper BB (Exit Zone)',
-                line=dict(color=COL_BEAR, width=1, dash='dash'),
-                hovertemplate="<b>Upper BB</b><br>%{y:.3f}"
-            ))
-
-        if bb_mid_filt is not None and len(bb_mid_filt) > 0:
-            fig.add_trace(go.Scatter(
-                x=bb_mid_filt.index, y=bb_mid_filt,
-                mode='lines', name='Middle BB',
-                line=dict(color=TEXT_SECONDARY, width=1, dash='dash'),
-                hovertemplate="<b>Mid BB</b><br>%{y:.3f}"
-            ))
-
-        if bb_lo_filt is not None and len(bb_lo_filt) > 0:
-            fig.add_trace(go.Scatter(
-                x=bb_lo_filt.index, y=bb_lo_filt,
-                mode='lines', name='Lower BB (Entry Zone)',
-                line=dict(color=COL_BULL, width=1, dash='dash'),
-                hovertemplate="<b>Lower BB</b><br>%{y:.3f}"
-            ))
-
-        # Current price line
-        current_price_val = d.get('silver') or 0
-        fig.add_hline(
-            y=current_price_val,
-            line=dict(color="#FF9500", width=2, dash="solid"),
-            annotation_text=f"Current: ${current_price_val:.3f}",
-            annotation_position="right"
-        )
-
-        fig.update_layout(
-            title="Last 1 Hour Silver Price Action (5-Min Candles with Entry/Exit Zones)",
-            yaxis_title="Price (USD)",
-            xaxis_title="Time",
-            template='plotly_white',
-            height=int(380 * H),
-            hovermode='x unified',
-            xaxis=dict(tickformat='%H:%M'),
-            yaxis=dict(tickformat="$.3f"),
-            margin=dict(l=60, r=40, t=40, b=40),
-            plot_bgcolor=PLOT_BG,
-            paper_bgcolor=PLOT_BG
-        )
-
-        fig.update_yaxes(gridcolor=GRID_COL)
-        st.plotly_chart(fig, use_container_width=True, key="1h_price_action")
-
-        # Quick interpretation
-        last_close = s5m_last_1h['Close'].iloc[-1]
-        price_at_upper = last_close > (bb_up_filt.iloc[-1] if bb_up_filt is not None and len(bb_up_filt) > 0 else 0)
-        price_at_lower = last_close < (bb_lo_filt.iloc[-1] if bb_lo_filt is not None and len(bb_lo_filt) > 0 else 0)
-
-        if price_at_upper:
-            zone_status = "⚠️ Price at UPPER BB - Overbought, consider exit for bulls / entry for bears"
-        elif price_at_lower:
-            zone_status = "✅ Price at LOWER BB - Oversold, consider entry for bulls / exit for bears"
-        else:
-            zone_status = "⏸️ Price in MIDDLE zone - Neutral, wait for breakout"
-
-        st.caption(zone_status)
-
-st.markdown("")
-
-# Entry/Exit Analysis Cards
-
-bb_lower = d.get('bb_lo_5m') or 0
-bb_mid = d.get('bb_mid_5m') or 0
-bb_upper = d.get('bb_up_5m') or 0
-current_price = d.get('silver') or 0
-
-if is_bull_analysis:
-    # BULL - Entry Card
-    entry_dist = current_price - bb_lower if current_price > bb_lower else 0
-    entry_status_bull = 'Ready to enter when price dips to $' + f'{bb_lower:.3f}' if entry_dist > 0 else 'Already in entry zone!'
-    entry_position_bull = 'above' if entry_dist > 0 else 'below'
-    st.markdown(f"""
-<div style="border: 2px solid #00DD00; border-radius: 8px; padding: 16px; margin-bottom: 12px; background: rgba(0, 221, 0, 0.05);">
-    <div style="font-size: 13px; font-weight: bold; color: #000; margin-bottom: 8px;">📈 BULL ENTRY ZONE</div>
-    <div style="background: white; border: 1px solid #00DD00; border-radius: 4px; padding: 10px; margin-bottom: 10px;">
-        <div style="font-size: 10px; color: #666; margin-bottom: 4px; text-transform: uppercase; font-weight: bold;">Entry Level</div>
-        <div style="font-size: 14px; font-weight: bold; color: #00DD00;">${bb_lower:.3f}</div>
-        <div style="font-size: 10px; color: #555; margin-top: 4px;">Lower Bollinger Band (Oversold Zone)</div>
-    </div>
-    <div style="background: white; border: 1px solid #00DD00; border-radius: 4px; padding: 10px;">
-        <div style="font-size: 10px; color: #666; margin-bottom: 4px; text-transform: uppercase; font-weight: bold;">Current Position</div>
-        <div style="font-size: 10px; color: #555; line-height: 1.6;">
-            Price: ${current_price:.3f}<br>
-            Distance from entry: ${entry_dist:.3f} (Price is {entry_position_bull} entry zone)<br>
-            Status: {entry_status_bull}
-        </div>
-    </div>
-</div>
-""", unsafe_allow_html=True)
-
-    # BULL - Exit Card
-    exit_dist = bb_upper - current_price if current_price < bb_upper else 0
-    st.markdown(f"""
-<div style="border: 2px solid #FF0000; border-radius: 8px; padding: 16px; margin-bottom: 12px; background: rgba(255, 0, 0, 0.05);">
-    <div style="font-size: 13px; font-weight: bold; color: #000; margin-bottom: 8px;">📈 BULL EXIT ZONE</div>
-    <div style="background: white; border: 1px solid #FF0000; border-radius: 4px; padding: 10px; margin-bottom: 10px;">
-        <div style="font-size: 10px; color: #666; margin-bottom: 4px; text-transform: uppercase; font-weight: bold;">Target Price</div>
-        <div style="font-size: 14px; font-weight: bold; color: #FF0000;">${bb_upper:.3f}</div>
-        <div style="font-size: 10px; color: #555; margin-top: 4px;">Upper Bollinger Band (Overbought Zone)</div>
-    </div>
-    <div style="background: white; border: 1px solid #FF0000; border-radius: 4px; padding: 10px;">
-        <div style="font-size: 10px; color: #666; margin-bottom: 4px; text-transform: uppercase; font-weight: bold;">Exit Signals</div>
-        <div style="font-size: 10px; color: #555; line-height: 1.6;">
-            Profit target: ${bb_upper:.3f} (+${bb_upper - current_price:.3f} from now)<br>
-            Exit triggers: RSI > 70 OR MACD histogram turns red OR price closes above upper BB<br>
-            Don't hold for diminishing returns - exit at target or at first reversal signal
-        </div>
-    </div>
-</div>
-""", unsafe_allow_html=True)
-
-else:
-    # BEAR - Entry Card
-    entry_dist = bb_upper - current_price if current_price < bb_upper else 0
-    entry_status_bear = 'Ready to enter when price rises to $' + f'{bb_upper:.3f}' if entry_dist > 0 else 'Already in entry zone!'
-    entry_position_bear = 'below' if entry_dist > 0 else 'above'
-    st.markdown(f"""
-<div style="border: 2px solid #FF0000; border-radius: 8px; padding: 16px; margin-bottom: 12px; background: rgba(255, 0, 0, 0.05);">
-    <div style="font-size: 13px; font-weight: bold; color: #000; margin-bottom: 8px;">📉 BEAR ENTRY ZONE</div>
-    <div style="background: white; border: 1px solid #FF0000; border-radius: 4px; padding: 10px; margin-bottom: 10px;">
-        <div style="font-size: 10px; color: #666; margin-bottom: 4px; text-transform: uppercase; font-weight: bold;">Entry Level</div>
-        <div style="font-size: 14px; font-weight: bold; color: #FF0000;">${bb_upper:.3f}</div>
-        <div style="font-size: 10px; color: #555; margin-top: 4px;">Upper Bollinger Band (Overbought Zone)</div>
-    </div>
-    <div style="background: white; border: 1px solid #FF0000; border-radius: 4px; padding: 10px;">
-        <div style="font-size: 10px; color: #666; margin-bottom: 4px; text-transform: uppercase; font-weight: bold;">Current Position</div>
-        <div style="font-size: 10px; color: #555; line-height: 1.6;">
-            Price: ${current_price:.3f}<br>
-            Distance from entry: ${entry_dist:.3f} (Price is {entry_position_bear} entry zone)<br>
-            Status: {entry_status_bear}
-        </div>
-    </div>
-</div>
-""", unsafe_allow_html=True)
-
-    # BEAR - Exit Card
-    exit_dist = current_price - bb_lower if current_price > bb_lower else 0
-    st.markdown(f"""
-<div style="border: 2px solid #00DD00; border-radius: 8px; padding: 16px; margin-bottom: 12px; background: rgba(0, 221, 0, 0.05);">
-    <div style="font-size: 13px; font-weight: bold; color: #000; margin-bottom: 8px;">📉 BEAR EXIT ZONE</div>
-    <div style="background: white; border: 1px solid #00DD00; border-radius: 4px; padding: 10px; margin-bottom: 10px;">
-        <div style="font-size: 10px; color: #666; margin-bottom: 4px; text-transform: uppercase; font-weight: bold;">Target Price</div>
-        <div style="font-size: 14px; font-weight: bold; color: #00DD00;">${bb_lower:.3f}</div>
-        <div style="font-size: 10px; color: #555; margin-top: 4px;">Lower Bollinger Band (Oversold Zone)</div>
-    </div>
-    <div style="background: white; border: 1px solid #00DD00; border-radius: 4px; padding: 10px;">
-        <div style="font-size: 10px; color: #666; margin-bottom: 4px; text-transform: uppercase; font-weight: bold;">Exit Signals</div>
-        <div style="font-size: 10px; color: #555; line-height: 1.6;">
-            Profit target: ${bb_lower:.3f} (${current_price - bb_lower:.3f} profit from now)<br>
-            Exit triggers: RSI < 30 OR MACD histogram turns green OR price closes below lower BB<br>
-            Don't hold for diminishing returns - exit at target or at first reversal signal
-        </div>
-    </div>
-</div>
-""", unsafe_allow_html=True)
-
-st.markdown("")
-
-# Render Phase 3 entry precision signals: Bollinger Bands + RSI
-st.markdown(f"""
-<div style='font-size:13px;font-weight:bold;color:{TEXT_PRIMARY};margin-bottom:12px;margin-top:20px;'>
-🎯 Entry Precision Signals (Bollinger Bands + RSI)
-</div>
-""", unsafe_allow_html=True)
-
-phase_3_signals = ["Bollinger Bands + KC Squeeze (5m/1h)", "Oscillator Consensus (RSI + StochRSI + Williams%R)"]
-for sig in signals:
-    if sig['name'] in phase_3_signals:
-        render_signal_detail_card(sig, d, h=H)
-
-st.markdown("")
-st.markdown("---")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PHASE 4: REFERENCE & CONTEXT — "Additional Context (Optional)"
@@ -4522,16 +5116,23 @@ Additional analysis and reference information (collapsed by default)
 </div>
 """, unsafe_allow_html=True)
 
-# Collapsible section for remaining signals
-with st.expander("🔍 Detailed Analysis & Macro Context", expanded=False):
-    # Render remaining Phase 4 signals: Platinum, Copper/Gold
-    phase_4_signals = ["Platinum Trend (1h)", "Inter-Market: Copper/Gold"]
-    for sig in signals:
-        if sig['name'] in phase_4_signals:
-            render_signal_detail_card(sig, d, h=H)
+# Render Phase 3 signals OUTSIDE the expander so links work
+phase_3_signals = ["Bollinger Bands + KC Squeeze (15m/1h)", "Platinum Trend (1h)", "Inter-Market: Copper/Gold"]
+for sig in signals:
+    if sig['name'] in phase_3_signals:
+        # Add anchor for navigation
+        anchor_id = sig['name'].lower().replace(" ", "-").replace("(", "").replace(")", "").replace("+", "-").replace("/", "").replace(",", "").replace(":", "").replace("%", "")
+        # Collapse consecutive dashes into single dashes
+        while "--" in anchor_id:
+            anchor_id = anchor_id.replace("--", "-")
+        # Use a span with both id and name attributes, with a zero-width space to ensure it renders
+        st.markdown(f'<span id="{anchor_id}" name="{anchor_id}" style="display:block; height:0; margin:0; padding:0;">‌</span>', unsafe_allow_html=True)
+        render_signal_detail_card(sig, d, h=H)
 
-    st.markdown("")
+st.markdown("")
 
+# Collapsible section for reference information only
+with st.expander("🔍 Additional Analysis & Market Data", expanded=False):
     # Signal history chart
     st.markdown(f"<div style='font-size:12px;font-weight:bold;color:{TEXT_PRIMARY};margin:16px 0 8px 0;'>Signal Performance (Last 45 Min)</div>", unsafe_allow_html=True)
     render_signal_history_chart(st.session_state.signal_history)
