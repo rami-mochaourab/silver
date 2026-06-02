@@ -47,7 +47,7 @@ COL_MFI  = "#CC00CC"   # Magenta for MFI
 PLOT_BG  = "#FFFFFF"
 GRID_COL = "rgba(0,0,0,0.08)"
 
-# Add CSS for minimalist dark theme
+# Add CSS for minimalist dark theme + mobile optimization
 st.markdown(f"""
 <style>
     :root {{
@@ -59,14 +59,18 @@ st.markdown(f"""
     body {{
         background-color: {BG_DARK};
         color: {TEXT_PRIMARY};
+        margin: 0;
+        padding: 0;
     }}
 
     [data-testid="stMetricValue"] {{
         color: {TEXT_PRIMARY} !important;
+        font-size: 1.8rem !important;
     }}
 
     [data-testid="stMetricLabel"] {{
         color: {TEXT_SECONDARY} !important;
+        font-size: 0.85rem !important;
     }}
 
     .element-container {{
@@ -76,6 +80,95 @@ st.markdown(f"""
     /* Remove decorative gradients and shadows */
     [data-testid="stExpander"] {{
         border-color: rgba(255,255,255,0.15) !important;
+    }}
+
+    /* ━━━━━━━━━━━━━━━━━━ MOBILE OPTIMIZATION ━━━━━━━━━━━━━━━━━━ */
+
+    /* Reduce padding on mobile */
+    @media (max-width: 640px) {{
+        [data-testid="stAppViewContainer"] {{
+            padding: 0.5rem !important;
+        }}
+
+        [data-testid="stMetricValue"] {{
+            font-size: 1.4rem !important;
+        }}
+
+        [data-testid="stMetricLabel"] {{
+            font-size: 0.75rem !important;
+        }}
+
+        /* Stack columns vertically on mobile */
+        [data-testid="stHorizontalBlock"] {{
+            flex-direction: column !important;
+        }}
+
+        /* Make all column children full width on mobile */
+        [data-testid="stHorizontalBlock"] > * {{
+            width: 100% !important;
+            margin-right: 0 !important;
+        }}
+
+        /* Improve sidebar readability */
+        [data-testid="stSidebar"] {{
+            width: 100% !important;
+        }}
+
+        /* Reduce chart margins and height on mobile */
+        .plotly-graph-div {{
+            margin-bottom: 0.5rem !important;
+            height: 350px !important;
+        }}
+
+        /* Better spacing for buttons */
+        button {{
+            padding: 0.5rem 0.75rem !important;
+            font-size: 0.9rem !important;
+            width: 100% !important;
+        }}
+
+        /* Reduce header padding */
+        h1, h2, h3 {{
+            margin: 0.5rem 0 !important;
+            font-size: 1.3rem !important;
+        }}
+
+        h1 {{
+            font-size: 1.5rem !important;
+        }}
+
+        /* Improve readability of expanders */
+        [data-testid="stExpander"] {{
+            font-size: 0.9rem !important;
+        }}
+
+        /* Make tables scrollable on mobile */
+        [data-testid="element-container"] table {{
+            font-size: 0.8rem !important;
+        }}
+    }}
+
+    /* Tablet optimization (641px - 1024px) */
+    @media (min-width: 641px) and (max-width: 1024px) {{
+        [data-testid="stMetricValue"] {{
+            font-size: 1.6rem !important;
+        }}
+
+        /* Limit columns to 2 on tablet */
+        [data-testid="stHorizontalBlock"] {{
+            max-width: 100% !important;
+        }}
+
+        .plotly-graph-div {{
+            height: 400px !important;
+        }}
+    }}
+
+    /* Desktop optimization (1025px+) */
+    @media (min-width: 1025px) {{
+        .plotly-graph-div {{
+            height: 450px !important;
+        }}
     }}
 </style>
 """, unsafe_allow_html=True)
@@ -348,6 +441,16 @@ def apply_time_filter(series, hours=None):
         cutoff_time = last_time - timedelta(hours=hours)
         return series[series.index >= cutoff_time]
     return series
+
+def get_mobile_columns(desktop_count, mobile_count=1):
+    """
+    Create mobile-responsive columns.
+    On mobile: uses mobile_count columns (usually 1-2)
+    On desktop: uses desktop_count columns
+
+    Note: Returns desktop_count by default. CSS media queries handle mobile stacking.
+    """
+    return st.columns(desktop_count)
 
 def data_age_hours(last_ts):
     now = datetime.now(timezone.utc)
