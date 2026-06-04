@@ -1027,9 +1027,14 @@ def gather_intelligence():
         gs_5d_max   = round(float(gs_series.max()), 2)  if len(gs_series) > 0 else gs_ratio
         gs_5d_min   = round(float(gs_series.min()), 2)  if len(gs_series) > 0 else gs_ratio
 
-        # Copper inter-market
+        # Copper inter-market and correlations
         copper_ratio = copper_ratio_ma8 = None
         cu_s = None  # Initialize copper/gold ratio series
+
+        # Correlation analysis: Is silver moving with gold (safe-haven) or copper (industrial)?
+        corr_ag_au = corr_ag_cu = corr_cu_au = None
+        corr_ag_au_series = corr_ag_cu_series = corr_cu_au_series = None
+
         if not c5m.empty and live_copper:
             c1h_rs = resample_ohlcv(c5m, "1h")
             if not c1h_rs.empty and len(c1h_rs) >= 2:
@@ -1037,6 +1042,28 @@ def gather_intelligence():
                 if len(cu_s) >= 1:
                     copper_ratio     = round(float(cu_s.iloc[-1]), 2)
                     copper_ratio_ma8 = round(float(cu_s.tail(8).mean()), 2) if len(cu_s) >= 8 else None
+
+                # Calculate correlations using 50-period rolling window (1h data = ~2 days)
+                if len(s1h) >= 50 and len(g1h) >= 50 and len(c1h_rs) >= 50:
+                    # Align indices for correlation calculation
+                    common_idx = s1h.index.intersection(g1h.index).intersection(c1h_rs.index)
+                    if len(common_idx) >= 50:
+                        s_common = s1h.loc[common_idx, 'Close']
+                        g_common = g1h.loc[common_idx, 'Close']
+                        c_common = c1h_rs.loc[common_idx, 'Close']
+
+                        # Calculate rolling correlations (50-period = ~2 days on 1h data)
+                        corr_ag_au_series = s_common.rolling(50).corr(g_common)
+                        corr_ag_cu_series = s_common.rolling(50).corr(c_common)
+                        corr_cu_au_series = c_common.rolling(50).corr(g_common)
+
+                        # Current values
+                        if len(corr_ag_au_series) > 0:
+                            corr_ag_au = round(float(corr_ag_au_series.iloc[-1]), 3)
+                        if len(corr_ag_cu_series) > 0:
+                            corr_ag_cu = round(float(corr_ag_cu_series.iloc[-1]), 3)
+                        if len(corr_cu_au_series) > 0:
+                            corr_cu_au = round(float(corr_cu_au_series.iloc[-1]), 3)
 
         # Momentum
         def mom5m(n):
@@ -1076,6 +1103,9 @@ def gather_intelligence():
             "dxy5m": dxy5m, "dxy1h": dxy1h,
             "gs_ratio": gs_series,
             "cu_ratio": cu_s,  # Copper/Gold ratio series for Inter-Market chart
+            "corr_ag_au": corr_ag_au_series,  # Ag-Au correlation (safe-haven)
+            "corr_ag_cu": corr_ag_cu_series,  # Ag-Cu correlation (industrial)
+            "corr_cu_au": corr_cu_au_series,  # Cu-Au correlation (risk-on/off)
             "pt1h": pt1h,
             # 5m series
             "rsi_5m": rsi_5m_s, "stoch_rsi_5m": stoch_rsi_5m_s, "williams_r_5m": williams_r_5m_s, "mfi_5m": mfi_5m_s,
@@ -1157,6 +1187,7 @@ def gather_intelligence():
             "dxy_ma20": dxy_ma20_15m, "dxy_trend": dxy_trend,
             # Inter-market
             "copper_ratio": copper_ratio, "copper_ratio_ma8": copper_ratio_ma8,
+            "corr_ag_au": corr_ag_au, "corr_ag_cu": corr_ag_cu, "corr_cu_au": corr_cu_au,
             # Momentum / vol
             "mom_5m": mom_5m, "mom_1h": mom_1h, "mom_4h": mom_4h, "mom_24h": mom_24h,
             "vol_1h": vol_1h, "vol_ratio": vol_ratio,
@@ -4554,6 +4585,108 @@ def render_signal_detail_card(signal, d, h=1.0):
                             margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified')
             fig.update_yaxes(gridcolor=GRID_COL, tickformat=".1f")
             st.plotly_chart(fig, use_container_width=True, key=chart_key)
+
+            # ────────────────────────────────────────────────────────────
+            # Correlation Analysis: Safe-Haven vs Industrial Demand
+            # ────────────────────────────────────────────────────────────
+            st.markdown("<div style='margin-top: 20px;'></div>", unsafe_allow_html=True)
+            st.markdown("### 📊 Correlation Analysis: What's Driving Silver?")
+
+            # Get correlation data
+            corr_ag_au_series = d['chart'].get('corr_ag_au')
+            corr_ag_cu_series = d['chart'].get('corr_ag_cu')
+            corr_cu_au_series = d['chart'].get('corr_cu_au')
+
+            # Display current correlation values
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                corr_ag_au_val = d.get('corr_ag_au')
+                if corr_ag_au_val is not None:
+                    st.metric("Ag-Au (Safe-Haven)", f"{corr_ag_au_val:.3f}",
+                             help="Correlation with Gold. High = Silver moving with safe-haven demand")
+                else:
+                    st.metric("Ag-Au (Safe-Haven)", "N/A")
+
+            with col2:
+                corr_ag_cu_val = d.get('corr_ag_cu')
+                if corr_ag_cu_val is not None:
+                    st.metric("Ag-Cu (Industrial)", f"{corr_ag_cu_val:.3f}",
+                             help="Correlation with Copper. High = Silver moving with industrial demand")
+                else:
+                    st.metric("Ag-Cu (Industrial)", "N/A")
+
+            with col3:
+                corr_cu_au_val = d.get('corr_cu_au')
+                if corr_cu_au_val is not None:
+                    st.metric("Cu-Au (Risk-On/Off)", f"{corr_cu_au_val:.3f}",
+                             help="Correlation between Copper and Gold. Determines market regime")
+                else:
+                    st.metric("Cu-Au (Risk-On/Off)", "N/A")
+
+            # Plot correlation time series
+            if corr_ag_au_series is not None and not corr_ag_au_series.empty:
+                corr_ag_au_filtered = apply_time_filter(corr_ag_au_series.dropna(), selected_hours)
+                corr_ag_cu_filtered = apply_time_filter(corr_ag_cu_series.dropna(), selected_hours) if corr_ag_cu_series is not None else None
+                corr_cu_au_filtered = apply_time_filter(corr_cu_au_series.dropna(), selected_hours) if corr_cu_au_series is not None else None
+
+                if len(corr_ag_au_filtered) > 0:
+                    x_corr = list(range(len(corr_ag_au_filtered)))
+                    corr_dates = [to_swedish_time(idx) for idx in corr_ag_au_filtered.index]
+
+                    label_interval_corr = max(1, len(corr_ag_au_filtered) // 6)
+                    label_indices_corr = [i for i in range(len(corr_ag_au_filtered)) if i % label_interval_corr == 0]
+                    label_times_corr = [to_swedish_time(corr_ag_au_filtered.index[i]) for i in label_indices_corr]
+
+                    fig_corr = go.Figure()
+
+                    # Add correlation lines
+                    fig_corr.add_trace(go.Scatter(x=x_corr, y=corr_ag_au_filtered,
+                                                 line=dict(color="#9933FF", width=2),
+                                                 name="Ag-Au (Safe-Haven)", fill=None,
+                                                 hovertext=corr_dates, hovertemplate="<b>%{hovertext}</b><br>Ag-Au: %{y:.3f}<extra></extra>"))
+
+                    if corr_ag_cu_filtered is not None and len(corr_ag_cu_filtered) > 0:
+                        fig_corr.add_trace(go.Scatter(x=list(range(len(corr_ag_cu_filtered))), y=corr_ag_cu_filtered,
+                                                     line=dict(color="#FF6600", width=2),
+                                                     name="Ag-Cu (Industrial)", fill=None,
+                                                     hovertext=corr_dates[:len(corr_ag_cu_filtered)], hovertemplate="<b>%{hovertext}</b><br>Ag-Cu: %{y:.3f}<extra></extra>"))
+
+                    if corr_cu_au_filtered is not None and len(corr_cu_au_filtered) > 0:
+                        fig_corr.add_trace(go.Scatter(x=list(range(len(corr_cu_au_filtered))), y=corr_cu_au_filtered,
+                                                     line=dict(color="#0066CC", width=2, dash="dash"),
+                                                     name="Cu-Au (Risk Regime)", fill=None,
+                                                     hovertext=corr_dates[:len(corr_cu_au_filtered)], hovertemplate="<b>%{hovertext}</b><br>Cu-Au: %{y:.3f}<extra></extra>"))
+
+                    # Add reference lines
+                    fig_corr.add_hline(y=0.5, line=dict(color="green", dash="dot", width=1), annotation_text="Strong Positive")
+                    fig_corr.add_hline(y=-0.5, line=dict(color="red", dash="dot", width=1), annotation_text="Strong Negative")
+                    fig_corr.add_hline(y=0, line=dict(color="gray", dash="solid", width=1))
+
+                    fig_corr.update_layout(height=int(280 * h), plot_bgcolor=PLOT_BG, paper_bgcolor=PLOT_BG,
+                                         title="Silver Correlation Analysis (50-period rolling)",
+                                         yaxis_title="Correlation Coefficient", xaxis_title="Time",
+                                         xaxis=dict(ticktext=label_times_corr, tickvals=label_indices_corr, gridcolor=GRID_COL),
+                                         yaxis=dict(range=[-1, 1]),
+                                         margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified')
+                    fig_corr.update_yaxes(gridcolor=GRID_COL, tickformat=".2f")
+                    st.plotly_chart(fig_corr, use_container_width=True, key=chart_key + "_corr")
+
+            # Analysis interpretation
+            st.markdown("#### 💡 Interpretation")
+            corr_ag_au_val = d.get('corr_ag_au')
+            corr_ag_cu_val = d.get('corr_ag_cu')
+
+            if corr_ag_au_val is not None and corr_ag_cu_val is not None:
+                if corr_ag_au_val > 0.4 and corr_ag_cu_val < 0.2:
+                    driver = "🔐 **SAFE-HAVEN MODE**: Silver is trading more with Gold. Expect silver to move with risk-off sentiment and currency weakness."
+                elif corr_ag_cu_val > 0.4 and corr_ag_au_val < 0.2:
+                    driver = "⚙️ **INDUSTRIAL MODE**: Silver is trading more with Copper. Expect silver to move with economic growth and industrial demand."
+                elif corr_ag_au_val > 0.3 and corr_ag_cu_val > 0.3:
+                    driver = "🔄 **MIXED DRIVERS**: Silver is correlating with both Gold and Copper. Both factors are influencing price."
+                else:
+                    driver = "⚪ **RANGING MODE**: Low correlations suggest silver is trading independently. Look for micro drivers."
+
+                st.markdown(driver)
         elif "VWAP" in sig_name:
             # VWAP: Volume-Weighted Average Price - institutional intraday benchmark
             # Shows 15m and 1h candles with VWAP overlay for entry timing + trend confirmation
