@@ -4662,11 +4662,40 @@ def render_signal_detail_card(signal, d, h=1.0):
                     fig_corr.add_hline(y=-0.5, line=dict(color="red", dash="dot", width=1), annotation_text="Strong Negative")
                     fig_corr.add_hline(y=0, line=dict(color="gray", dash="solid", width=1))
 
-                    fig_corr.update_layout(height=int(280 * h), plot_bgcolor=PLOT_BG, paper_bgcolor=PLOT_BG,
+                    # Calculate adaptive y-axis range based on actual data
+                    all_corr_values = []
+                    if len(corr_ag_au_filtered) > 0:
+                        all_corr_values.extend(corr_ag_au_filtered.dropna().values)
+                    if corr_ag_cu_filtered is not None and len(corr_ag_cu_filtered) > 0:
+                        all_corr_values.extend(corr_ag_cu_filtered.dropna().values)
+                    if corr_cu_au_filtered is not None and len(corr_cu_au_filtered) > 0:
+                        all_corr_values.extend(corr_cu_au_filtered.dropna().values)
+
+                    if all_corr_values:
+                        data_min = min(all_corr_values)
+                        data_max = max(all_corr_values)
+                        data_range = data_max - data_min
+                        # Add 20% padding for better visibility
+                        y_padding = max(data_range * 0.2, 0.1)  # At least 0.1 padding
+                        y_min = max(data_min - y_padding, -1.0)
+                        y_max = min(data_max + y_padding, 1.0)
+                    else:
+                        y_min, y_max = -1.0, 1.0
+
+                    # Adaptive chart height based on data range
+                    # More variance = taller chart for better visualization
+                    if data_range < 0.3:
+                        chart_height = int(400 * h)  # Tall for small variations
+                    elif data_range < 0.6:
+                        chart_height = int(350 * h)  # Medium-tall
+                    else:
+                        chart_height = int(320 * h)  # Standard height for wide ranges
+
+                    fig_corr.update_layout(height=chart_height, plot_bgcolor=PLOT_BG, paper_bgcolor=PLOT_BG,
                                          title="Silver Correlation Analysis (50-period rolling)",
                                          yaxis_title="Correlation Coefficient", xaxis_title="Time",
                                          xaxis=dict(ticktext=label_times_corr, tickvals=label_indices_corr, gridcolor=GRID_COL),
-                                         yaxis=dict(range=[-1, 1]),
+                                         yaxis=dict(range=[y_min, y_max]),
                                          margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified')
                     fig_corr.update_yaxes(gridcolor=GRID_COL, tickformat=".2f")
                     st.plotly_chart(fig_corr, use_container_width=True, key=chart_key + "_corr")
