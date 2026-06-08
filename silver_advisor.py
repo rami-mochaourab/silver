@@ -1103,9 +1103,9 @@ def gather_intelligence():
             "dxy5m": dxy5m, "dxy1h": dxy1h,
             "gs_ratio": gs_series,
             "cu_ratio": cu_s,  # Copper/Gold ratio series for Inter-Market chart
-            "corr_ag_au": corr_ag_au_series,  # Ag-Au correlation (safe-haven)
-            "corr_ag_cu": corr_ag_cu_series,  # Ag-Cu correlation (industrial)
-            "corr_cu_au": corr_cu_au_series,  # Cu-Au correlation (risk-on/off)
+            "corr_ag_au": corr_ag_au_series,  # Silver-Gold correlation (safe-haven)
+            "corr_ag_cu": corr_ag_cu_series,  # Silver-Copper correlation (industrial)
+            "corr_cu_au": corr_cu_au_series,  # Copper-Gold correlation (risk-on/off)
             "pt1h": pt1h,
             # 5m series
             "rsi_5m": rsi_5m_s, "stoch_rsi_5m": stoch_rsi_5m_s, "williams_r_5m": williams_r_5m_s, "mfi_5m": mfi_5m_s,
@@ -4602,26 +4602,26 @@ def render_signal_detail_card(signal, d, h=1.0):
             with col1:
                 corr_ag_au_val = d.get('corr_ag_au')
                 if corr_ag_au_val is not None:
-                    st.metric("Ag-Au (Safe-Haven)", f"{corr_ag_au_val:.3f}",
+                    st.metric("Silver-Gold (Safe-Haven)", f"{corr_ag_au_val:.3f}",
                              help="Correlation with Gold. High = Silver moving with safe-haven demand")
                 else:
-                    st.metric("Ag-Au (Safe-Haven)", "N/A")
+                    st.metric("Silver-Gold (Safe-Haven)", "N/A")
 
             with col2:
                 corr_ag_cu_val = d.get('corr_ag_cu')
                 if corr_ag_cu_val is not None:
-                    st.metric("Ag-Cu (Industrial)", f"{corr_ag_cu_val:.3f}",
+                    st.metric("Silver-Copper (Industrial)", f"{corr_ag_cu_val:.3f}",
                              help="Correlation with Copper. High = Silver moving with industrial demand")
                 else:
-                    st.metric("Ag-Cu (Industrial)", "N/A")
+                    st.metric("Silver-Copper (Industrial)", "N/A")
 
             with col3:
                 corr_cu_au_val = d.get('corr_cu_au')
                 if corr_cu_au_val is not None:
-                    st.metric("Cu-Au (Risk-On/Off)", f"{corr_cu_au_val:.3f}",
+                    st.metric("Copper-Gold (Risk-On/Off)", f"{corr_cu_au_val:.3f}",
                              help="Correlation between Copper and Gold. Determines market regime")
                 else:
-                    st.metric("Cu-Au (Risk-On/Off)", "N/A")
+                    st.metric("Copper-Gold (Risk-On/Off)", "N/A")
 
             # Plot correlation time series
             if corr_ag_au_series is not None and not corr_ag_au_series.empty:
@@ -4642,20 +4642,20 @@ def render_signal_detail_card(signal, d, h=1.0):
                     # Add correlation lines
                     fig_corr.add_trace(go.Scatter(x=x_corr, y=corr_ag_au_filtered,
                                                  line=dict(color="#9933FF", width=2),
-                                                 name="Ag-Au (Safe-Haven)", fill=None,
-                                                 hovertext=corr_dates, hovertemplate="<b>%{hovertext}</b><br>Ag-Au: %{y:.3f}<extra></extra>"))
+                                                 name="Silver-Gold (Safe-Haven)", fill=None,
+                                                 hovertext=corr_dates, hovertemplate="<b>%{hovertext}</b><br>Silver-Gold: %{y:.3f}<extra></extra>"))
 
                     if corr_ag_cu_filtered is not None and len(corr_ag_cu_filtered) > 0:
                         fig_corr.add_trace(go.Scatter(x=list(range(len(corr_ag_cu_filtered))), y=corr_ag_cu_filtered,
                                                      line=dict(color="#FF6600", width=2),
-                                                     name="Ag-Cu (Industrial)", fill=None,
-                                                     hovertext=corr_dates[:len(corr_ag_cu_filtered)], hovertemplate="<b>%{hovertext}</b><br>Ag-Cu: %{y:.3f}<extra></extra>"))
+                                                     name="Silver-Copper (Industrial)", fill=None,
+                                                     hovertext=corr_dates[:len(corr_ag_cu_filtered)], hovertemplate="<b>%{hovertext}</b><br>Silver-Copper: %{y:.3f}<extra></extra>"))
 
                     if corr_cu_au_filtered is not None and len(corr_cu_au_filtered) > 0:
                         fig_corr.add_trace(go.Scatter(x=list(range(len(corr_cu_au_filtered))), y=corr_cu_au_filtered,
                                                      line=dict(color="#0066CC", width=2, dash="dash"),
-                                                     name="Cu-Au (Risk Regime)", fill=None,
-                                                     hovertext=corr_dates[:len(corr_cu_au_filtered)], hovertemplate="<b>%{hovertext}</b><br>Cu-Au: %{y:.3f}<extra></extra>"))
+                                                     name="Copper-Gold (Risk Regime)", fill=None,
+                                                     hovertext=corr_dates[:len(corr_cu_au_filtered)], hovertemplate="<b>%{hovertext}</b><br>Copper-Gold: %{y:.3f}<extra></extra>"))
 
                     # Add reference lines
                     fig_corr.add_hline(y=0.5, line=dict(color="green", dash="dot", width=1), annotation_text="Strong Positive")
