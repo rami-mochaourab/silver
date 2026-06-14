@@ -26,7 +26,7 @@ st.set_page_config(page_title="Silver Pro Advisor", layout="wide", initial_sideb
 
 # Configure allowed email addresses (whitelist)
 ALLOWED_EMAILS = [
-    "your_email@gmail.com",  # Replace with your email
+    "rami.mochaourab@gmail.com",  # Rami's email
     # Add more emails as needed
 ]
 
