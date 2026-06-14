@@ -146,14 +146,15 @@ if not st.session_state.get("authenticated", False):
             test_email = st.text_input("Enter your email to test login:", placeholder="your_email@gmail.com")
             if st.button("🔓 Test Login", use_container_width=True):
                 if test_email and "@" in test_email:
-                    if test_email in ALLOWED_EMAILS or len(ALLOWED_EMAILS) == 1:
+                    # STRICT whitelist check - email MUST be in ALLOWED_EMAILS
+                    if test_email.lower() in [e.lower() for e in ALLOWED_EMAILS]:
                         st.session_state.authenticated = True
                         st.session_state.user_email = test_email
                         st.session_state.user_name = test_email.split("@")[0].title()
                         st.success(f"✅ Logged in as {test_email}")
                         st.rerun()
                     else:
-                        st.error(f"❌ Email {test_email} is not authorized. Contact admin.")
+                        st.error(f"❌ Email {test_email} is NOT authorized.\n\nAuthorized emails: {', '.join(ALLOWED_EMAILS)}")
                 else:
                     st.error("Please enter a valid email address")
 
