@@ -9,14 +9,24 @@ import requests
 from bs4 import BeautifulSoup
 import pytz
 import os
-from google_auth_oauthlib.flow import Flow
 import json
+from google_auth_oauthlib.flow import Flow
+from google.oauth2.service_account import Credentials
+import base64
 
 try:
     from streamlit_autorefresh import st_autorefresh
     AUTO_REFRESH_AVAILABLE = True
 except ImportError:
     AUTO_REFRESH_AVAILABLE = False
+
+# Initialize session state for authentication
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+if "user_email" not in st.session_state:
+    st.session_state.user_email = None
+if "user_name" not in st.session_state:
+    st.session_state.user_name = None
 
 st.set_page_config(page_title="Silver Pro Advisor", layout="wide", initial_sidebar_state="expanded")
 
@@ -30,158 +40,189 @@ ALLOWED_EMAILS = [
     # Add more emails as needed
 ]
 
-# For local testing, use credentials.json from Google Cloud Console
-# For Streamlit Cloud, use st.secrets
-def get_google_oauth_credentials():
-    """Get Google OAuth credentials from secrets or local file"""
+# Google OAuth Configuration
+GOOGLE_CLIENT_ID = "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com"  # Replace with your Client ID
+GOOGLE_CLIENT_SECRET = "YOUR_GOOGLE_CLIENT_SECRET"  # Replace with your Client Secret
+SCOPES = ['https://www.googleapis.com/auth/userinfo.email', 'https://www.googleapis.com/auth/userinfo.profile']
+
+def get_oauth_config():
+    """Get OAuth configuration from secrets or environment"""
     try:
-        # Try to get from Streamlit secrets (Cloud)
-        if "google_oauth" in st.secrets:
-            return st.secrets["google_oauth"]
-        # Fall back to local credentials.json file
-        elif os.path.exists("credentials.json"):
-            with open("credentials.json", "r") as f:
-                return json.load(f)
-    except Exception as e:
-        st.error(f"Could not load Google OAuth credentials: {e}")
+        # Try Streamlit secrets first (for Cloud deployment)
+        if "google_client_id" in st.secrets and "google_client_secret" in st.secrets:
+            return {
+                "client_id": st.secrets["google_client_id"],
+                "client_secret": st.secrets["google_client_secret"],
+                "redirect_uri": st.secrets.get("redirect_uri", "http://localhost:8501")
+            }
+        # Try environment variables
+        elif os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET"):
+            return {
+                "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+                "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
+                "redirect_uri": os.getenv("REDIRECT_URI", "http://localhost:8501")
+            }
+    except:
+        pass
     return None
 
-def check_google_login():
-    """Handle Google OAuth login"""
-    # Initialize session state for authentication
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
-    if "user_email" not in st.session_state:
-        st.session_state.user_email = None
-    if "user_name" not in st.session_state:
-        st.session_state.user_name = None
-
-    # Check if user is already authenticated via session
-    if st.session_state.authenticated:
-        return True
-
-    # Check for OAuth callback in URL params (after Google redirect)
+def handle_oauth_callback():
+    """Handle OAuth callback from Google"""
     query_params = st.query_params
+
+    # Check for authorization code in URL
     if "code" in query_params:
+        code = query_params["code"]
+        oauth_config = get_oauth_config()
+
+        if not oauth_config:
+            st.error("OAuth configuration not found. Please set up Google OAuth credentials.")
+            return False
+
         try:
-            creds = get_google_oauth_credentials()
-            if creds:
-                # This would handle the OAuth flow
-                # For now, we'll use a simplified approach with st.secrets
+            # Exchange authorization code for tokens
+            token_url = "https://oauth2.googleapis.com/token"
+            token_data = {
+                "code": code,
+                "client_id": oauth_config["client_id"],
+                "client_secret": oauth_config["client_secret"],
+                "redirect_uri": oauth_config["redirect_uri"],
+                "grant_type": "authorization_code"
+            }
+
+            token_response = requests.post(token_url, data=token_data)
+            token_response.raise_for_status()
+            tokens = token_response.json()
+
+            # Get user info using access token
+            userinfo_url = "https://www.googleapis.com/oauth2/v2/userinfo"
+            headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+            userinfo_response = requests.get(userinfo_url, headers=headers)
+            userinfo_response.raise_for_status()
+            userinfo = userinfo_response.json()
+
+            user_email = userinfo.get("email", "").lower()
+            user_name = userinfo.get("name", "User")
+
+            # Check if email is in whitelist
+            if user_email in [e.lower() for e in ALLOWED_EMAILS]:
                 st.session_state.authenticated = True
-                st.session_state.user_email = st.secrets.get("user_email", "user@example.com")
-                st.session_state.user_name = st.secrets.get("user_name", "User")
+                st.session_state.user_email = user_email
+                st.session_state.user_name = user_name
+
+                # Clear the code from URL
+                st.query_params.clear()
+                st.success(f"✅ Logged in as {user_email}")
                 st.rerun()
+            else:
+                st.error(f"❌ Email {user_email} is NOT authorized for this application.")
+                st.stop()
+
         except Exception as e:
-            st.error(f"Authentication error: {e}")
+            st.error(f"Authentication failed: {str(e)}")
+            return False
 
-    return False
+    return st.session_state.authenticated
 
-# Show login screen if not authenticated
-if not st.session_state.get("authenticated", False):
-    st.set_page_config(page_title="Silver Pro Advisor - Login", layout="centered")
+# Check for OAuth callback
+if not st.session_state.authenticated:
+    if not handle_oauth_callback():
+        # Show login page
+        st.set_page_config(page_title="Silver Pro Advisor - Login", layout="centered")
 
-    st.markdown("""
-    <style>
-        .login-container {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            min-height: 100vh;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        }
-        .login-box {
-            background: white;
-            padding: 40px;
-            border-radius: 10px;
-            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
-            max-width: 400px;
-            text-align: center;
-        }
-        .login-box h1 {
-            color: #333;
-            margin-bottom: 10px;
-        }
-        .login-box p {
-            color: #666;
-            margin-bottom: 30px;
-        }
-        .google-btn {
-            background-color: #4285F4;
-            color: white;
-            padding: 12px 30px;
-            border: none;
-            border-radius: 5px;
-            font-size: 16px;
-            cursor: pointer;
-            transition: background-color 0.3s;
-        }
-        .google-btn:hover {
-            background-color: #357ae8;
-        }
-    </style>
-    """, unsafe_allow_html=True)
-
-    col1, col2, col3 = st.columns([1, 2, 1])
-
-    with col2:
-        st.markdown("### 🥈 Silver Pro Advisor")
-        st.markdown("**Professional Silver Trading Analysis**")
-        st.markdown("---")
-
-        st.info("""
-        **Note:** For local testing, you can manually set authentication by:
-        1. Creating a `credentials.json` file with your Google OAuth credentials
-        2. Or adding your email to Streamlit secrets
-
-        See the **Setup Instructions** below.
-        """)
-
-        # Simplified login for development
-        st.markdown("#### 🔐 Authentication Setup")
-
-        col_test = st.columns(1)[0]
-        with col_test:
-            test_email = st.text_input("Enter your email to test login:", placeholder="your_email@gmail.com")
-            if st.button("🔓 Test Login", use_container_width=True):
-                if test_email and "@" in test_email:
-                    # STRICT whitelist check - email MUST be in ALLOWED_EMAILS
-                    if test_email.lower() in [e.lower() for e in ALLOWED_EMAILS]:
-                        st.session_state.authenticated = True
-                        st.session_state.user_email = test_email
-                        st.session_state.user_name = test_email.split("@")[0].title()
-                        st.success(f"✅ Logged in as {test_email}")
-                        st.rerun()
-                    else:
-                        st.error(f"❌ Email {test_email} is NOT authorized.\n\nAuthorized emails: {', '.join(ALLOWED_EMAILS)}")
-                else:
-                    st.error("Please enter a valid email address")
-
-        st.markdown("---")
         st.markdown("""
-        ### 📋 Setup Instructions
+        <style>
+            .login-box {
+                background: white;
+                padding: 40px;
+                border-radius: 10px;
+                box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+                max-width: 500px;
+                margin: 50px auto;
+            }
+            .google-btn {
+                background-color: #4285F4;
+                color: white;
+                padding: 12px 30px;
+                border: none;
+                border-radius: 5px;
+                font-size: 16px;
+                cursor: pointer;
+                transition: background-color 0.3s;
+                width: 100%;
+            }
+            .google-btn:hover {
+                background-color: #357ae8;
+            }
+        </style>
+        """, unsafe_allow_html=True)
 
-        **To enable Google OAuth login:**
+        col1, col2, col3 = st.columns([1, 2, 1])
 
-        1. Go to [Google Cloud Console](https://console.cloud.google.com)
-        2. Create a new project
-        3. Enable **Google+ API**
-        4. Create OAuth 2.0 credentials (Desktop application)
-        5. Download as JSON → save as `credentials.json`
-        6. Add redirect URI: `http://localhost:8501`
-        7. Update `ALLOWED_EMAILS` with your email
+        with col2:
+            st.markdown("### 🥈 Silver Pro Advisor")
+            st.markdown("**Professional Silver Trading Analysis**")
+            st.markdown("---")
 
-        **For Streamlit Cloud:**
-        - Go to your app settings
-        - Add secrets with your OAuth credentials
+            oauth_config = get_oauth_config()
 
-        Contact support for help!
-        """)
+            if oauth_config:
+                # Generate Google OAuth login URL
+                auth_url = (
+                    f"https://accounts.google.com/o/oauth2/v2/auth?"
+                    f"client_id={oauth_config['client_id']}&"
+                    f"redirect_uri={oauth_config['redirect_uri']}&"
+                    f"response_type=code&"
+                    f"scope=email%20profile&"
+                    f"access_type=offline"
+                )
+
+                st.markdown(f"[🔐 Login with Google]({auth_url})", unsafe_allow_html=True)
+                st.markdown("Click the button above to login with your Google account")
+
+            else:
+                st.warning("⚠️ Google OAuth Not Configured")
+                st.markdown("""
+                ### 📋 Setup Instructions
+
+                **Step 1: Get Google OAuth Credentials**
+                1. Go to [Google Cloud Console](https://console.cloud.google.com)
+                2. Create a new project
+                3. Enable **Google+ API**
+                4. Go to **Credentials** → **Create OAuth 2.0 Client ID**
+                5. Choose **Web application**
+                6. Add Authorized redirect URIs:
+                   - `http://localhost:8501` (local)
+                   - `https://your-app.streamlit.app` (Cloud)
+                7. Download the credentials JSON
+
+                **Step 2: Add Credentials to App**
+
+                **For Local Testing:**
+                ```python
+                GOOGLE_CLIENT_ID = "your_client_id.apps.googleusercontent.com"
+                GOOGLE_CLIENT_SECRET = "your_client_secret"
+                ```
+
+                **For Streamlit Cloud:**
+                Go to app settings → Secrets and add:
+                ```
+                [client_config]
+                google_client_id = "your_client_id.apps.googleusercontent.com"
+                google_client_secret = "your_client_secret"
+                redirect_uri = "https://your-app.streamlit.app"
+                ```
+
+                **Step 3: Update ALLOWED_EMAILS**
+                Update the list with authorized Google account emails
+
+                Then refresh the app!
+                """)
+
+            st.markdown("---")
+            st.markdown(f"**Authorized Emails:** {', '.join(ALLOWED_EMAILS)}")
 
         st.stop()
-
-    st.stop()
 
 # ═══════════════════════════════════════════════════════════════════
 # MINIMALIST COLOR PALETTE
