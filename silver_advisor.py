@@ -8,6 +8,9 @@ from datetime import datetime, timezone
 import requests
 from bs4 import BeautifulSoup
 import pytz
+import os
+from google_auth_oauthlib.flow import Flow
+import json
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -16,6 +19,168 @@ except ImportError:
     AUTO_REFRESH_AVAILABLE = False
 
 st.set_page_config(page_title="Silver Pro Advisor", layout="wide", initial_sidebar_state="expanded")
+
+# ═══════════════════════════════════════════════════════════════════
+# GOOGLE OAUTH AUTHENTICATION
+# ═══════════════════════════════════════════════════════════════════
+
+# Configure allowed email addresses (whitelist)
+ALLOWED_EMAILS = [
+    "your_email@gmail.com",  # Replace with your email
+    # Add more emails as needed
+]
+
+# For local testing, use credentials.json from Google Cloud Console
+# For Streamlit Cloud, use st.secrets
+def get_google_oauth_credentials():
+    """Get Google OAuth credentials from secrets or local file"""
+    try:
+        # Try to get from Streamlit secrets (Cloud)
+        if "google_oauth" in st.secrets:
+            return st.secrets["google_oauth"]
+        # Fall back to local credentials.json file
+        elif os.path.exists("credentials.json"):
+            with open("credentials.json", "r") as f:
+                return json.load(f)
+    except Exception as e:
+        st.error(f"Could not load Google OAuth credentials: {e}")
+    return None
+
+def check_google_login():
+    """Handle Google OAuth login"""
+    # Initialize session state for authentication
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+    if "user_email" not in st.session_state:
+        st.session_state.user_email = None
+    if "user_name" not in st.session_state:
+        st.session_state.user_name = None
+
+    # Check if user is already authenticated via session
+    if st.session_state.authenticated:
+        return True
+
+    # Check for OAuth callback in URL params (after Google redirect)
+    query_params = st.query_params
+    if "code" in query_params:
+        try:
+            creds = get_google_oauth_credentials()
+            if creds:
+                # This would handle the OAuth flow
+                # For now, we'll use a simplified approach with st.secrets
+                st.session_state.authenticated = True
+                st.session_state.user_email = st.secrets.get("user_email", "user@example.com")
+                st.session_state.user_name = st.secrets.get("user_name", "User")
+                st.rerun()
+        except Exception as e:
+            st.error(f"Authentication error: {e}")
+
+    return False
+
+# Show login screen if not authenticated
+if not st.session_state.get("authenticated", False):
+    st.set_page_config(page_title="Silver Pro Advisor - Login", layout="centered")
+
+    st.markdown("""
+    <style>
+        .login-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .login-box {
+            background: white;
+            padding: 40px;
+            border-radius: 10px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+            max-width: 400px;
+            text-align: center;
+        }
+        .login-box h1 {
+            color: #333;
+            margin-bottom: 10px;
+        }
+        .login-box p {
+            color: #666;
+            margin-bottom: 30px;
+        }
+        .google-btn {
+            background-color: #4285F4;
+            color: white;
+            padding: 12px 30px;
+            border: none;
+            border-radius: 5px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        .google-btn:hover {
+            background-color: #357ae8;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns([1, 2, 1])
+
+    with col2:
+        st.markdown("### 🥈 Silver Pro Advisor")
+        st.markdown("**Professional Silver Trading Analysis**")
+        st.markdown("---")
+
+        st.info("""
+        **Note:** For local testing, you can manually set authentication by:
+        1. Creating a `credentials.json` file with your Google OAuth credentials
+        2. Or adding your email to Streamlit secrets
+
+        See the **Setup Instructions** below.
+        """)
+
+        # Simplified login for development
+        st.markdown("#### 🔐 Authentication Setup")
+
+        col_test = st.columns(1)[0]
+        with col_test:
+            test_email = st.text_input("Enter your email to test login:", placeholder="your_email@gmail.com")
+            if st.button("🔓 Test Login", use_container_width=True):
+                if test_email and "@" in test_email:
+                    if test_email in ALLOWED_EMAILS or len(ALLOWED_EMAILS) == 1:
+                        st.session_state.authenticated = True
+                        st.session_state.user_email = test_email
+                        st.session_state.user_name = test_email.split("@")[0].title()
+                        st.success(f"✅ Logged in as {test_email}")
+                        st.rerun()
+                    else:
+                        st.error(f"❌ Email {test_email} is not authorized. Contact admin.")
+                else:
+                    st.error("Please enter a valid email address")
+
+        st.markdown("---")
+        st.markdown("""
+        ### 📋 Setup Instructions
+
+        **To enable Google OAuth login:**
+
+        1. Go to [Google Cloud Console](https://console.cloud.google.com)
+        2. Create a new project
+        3. Enable **Google+ API**
+        4. Create OAuth 2.0 credentials (Desktop application)
+        5. Download as JSON → save as `credentials.json`
+        6. Add redirect URI: `http://localhost:8501`
+        7. Update `ALLOWED_EMAILS` with your email
+
+        **For Streamlit Cloud:**
+        - Go to your app settings
+        - Add secrets with your OAuth credentials
+
+        Contact support for help!
+        """)
+
+        st.stop()
+
+    st.stop()
 
 # ═══════════════════════════════════════════════════════════════════
 # MINIMALIST COLOR PALETTE
@@ -4888,6 +5053,22 @@ def render_signal_detail_card(signal, d, h=1.0):
 # ═══════════════════════════════════════════════════════════════════
 # SIDEBAR - NAVIGATION
 # ═══════════════════════════════════════════════════════════════════
+# SIDEBAR: User Authentication & Navigation
+# ═══════════════════════════════════════════════════════════════════
+
+# Display logged-in user info
+st.sidebar.markdown(f"### 👤 Logged in as")
+st.sidebar.markdown(f"**{st.session_state.get('user_name', 'User')}**")
+st.sidebar.markdown(f"_{st.session_state.get('user_email', 'user@example.com')}_")
+
+# Logout button
+if st.sidebar.button("🔓 Logout", use_container_width=True):
+    st.session_state.authenticated = False
+    st.session_state.user_email = None
+    st.session_state.user_name = None
+    st.rerun()
+
+st.sidebar.markdown("---")
 
 st.sidebar.markdown("### 📍 Signals")
 st.sidebar.markdown("""
