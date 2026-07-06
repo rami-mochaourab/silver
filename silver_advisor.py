@@ -41,8 +41,7 @@ ALLOWED_EMAILS = [
 ]
 
 # Google OAuth Configuration
-GOOGLE_CLIENT_ID = "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com"  # Replace with your Client ID
-GOOGLE_CLIENT_SECRET = "YOUR_GOOGLE_CLIENT_SECRET"  # Replace with your Client Secret
+# Credentials managed via Streamlit Secrets (production) or environment variables (local)
 SCOPES = ['https://www.googleapis.com/auth/userinfo.email', 'https://www.googleapis.com/auth/userinfo.profile']
 
 def get_oauth_config():
@@ -1037,7 +1036,7 @@ def gather_intelligence():
         for name, feed in [("Silver 5m", s5m), ("Silver 1h", s1h),
                             ("Gold 1h", g1h), ("DXY 1h", dxy1h)]:
             if feed is None or feed.empty:
-                return None, f"{name} feed returned empty. Markets may be closed or Alpha Vantage rate limit hit."
+                return None, f"{name} feed returned empty. Markets may be closed or data unavailable."
 
         # Normalise timezones to UTC
         feeds = [s5m, s1h, g1h, c5m, dxy5m, dxy1h, pt1h]
@@ -1045,7 +1044,7 @@ def gather_intelligence():
             if df is not None and not df.empty and hasattr(df.index, 'tz') and df.index.tz is not None:
                 df.index = df.index.tz_convert("UTC")
 
-        # Build 4h frame from 1h data (Alpha Vantage provides ~200 candles, enough for resampling)
+        # Build 4h frame from 1h data
         s4h = resample_ohlcv(s1h, "4h")
 
         # Build 15m DXY frame (for macro context at entry-level precision)
